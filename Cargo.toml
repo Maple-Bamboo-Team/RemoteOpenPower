@@ -1,0 +1,36 @@
+[package]
+name = "RemoteOpenPower"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "=0.4.42", default-features = false, features = ["clock"] }
+crossterm = "=0.29.0"
+hex = "0.4"
+libc = "0.2"
+rand = "0.8"
+postcard = { version = "1.1", features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+snow = "0.10"
+socket2 = "0.6"
+thiserror = "2.0"
+toml = "0.8"
+tui-input = "=0.15.4"
+ratatui = "=0.30.2"
+wol = "0.5"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+zeroize = "1.8"
+
+# Dev 3级优化配置
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+overflow-checks = true

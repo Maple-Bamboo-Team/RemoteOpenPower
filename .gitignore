@@ -1,0 +1,11 @@
+# Build/cache output is redirected to E:\Catch\Cargo\Catch by .cargo/config.toml.
+/target/
+/target-local/
+/target-tmp/
+/logs/
+*.log
+
+# Role-separated credentials and local deployments are never source artifacts.
+*.credential.toml
+/remote-open-power.toml
+/.tmp-*.toml

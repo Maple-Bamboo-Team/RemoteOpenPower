@@ -1,0 +1,5 @@
+# Zig 0.16-dev warns about rustc's standard `-O1` linker argument even though
+# the link succeeds. Keep project and Clippy warnings enabled; suppress only
+# this external linker diagnostic for the Zig-built Linux target.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-A", "linker-messages"]
