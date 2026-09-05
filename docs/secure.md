@@ -4,7 +4,7 @@
 **口径：** 只列高危与中危。低危硬化、质量问题、残余威胁模型说明不收录。
 **总评：** 未发现未认证唤醒、Noise 认证绕过或 ACL 选错条目。高/中危集中在配置与协议不变量分裂、默认暴露面、目录侦察、共享 PSK 与跨客户端互斥。
 
-## 2026-09-04 源码复核状态
+## 2026-09-05 源码复核状态
 
 | ID | 当前状态 | 依据 |
 |----|----------|------|
@@ -25,10 +25,10 @@
 
 **位置**
 
-- [`config.rs`](../attachments/config.rs) `HostConfig::validate` / `is_valid_hostname`：主机名上限 128 字节
-- [`config.rs`](../attachments/config.rs) `HostConfig::host_id`：`hostname.trim().to_ascii_lowercase()`
-- [`protocol.rs`](../attachments/protocol.rs) `validate_id` / `MAX_ID_BYTES`：线上标识上限 **64** 字节
-- [`server.rs`](../attachments/server.rs) `make_response` → `ServerEnvelope::validate()`
+- [`config.rs`](../src/config.rs) `HostConfig::validate` / `is_valid_hostname`：主机名上限 128 字节
+- [`config.rs`](../src/config.rs) `HostConfig::host_id`：`hostname.trim().to_ascii_lowercase()`
+- [`protocol.rs`](../src/protocol.rs) `validate_id` / `MAX_ID_BYTES`：线上标识上限 **64** 字节
+- [`server.rs`](../src/server.rs) `make_response` → `ServerEnvelope::validate()`
 
 **问题**
 
@@ -57,10 +57,10 @@
 
 **位置**
 
-- [`config.rs`](../attachments/config.rs) `default_bind_address()` → `"::"`
-- [`config.rs`](../attachments/config.rs) `default_bind_address_v4()` → `"0.0.0.0"`
-- [`config.rs`](../attachments/config.rs) `dual_stack` 默认 `true`
-- [`tui.rs`](../attachments/tui.rs) 部署模板未限制绑定地址
+- [`config.rs`](../src/config.rs) `default_bind_address()` → `"::"`
+- [`config.rs`](../src/config.rs) `default_bind_address_v4()` → `"0.0.0.0"`
+- [`config.rs`](../src/config.rs) `dual_stack` 默认 `true`
+- [`tui.rs`](../src/tui.rs) 部署模板未限制绑定地址
 
 **问题**
 
@@ -86,10 +86,10 @@ systemd 片段限制了地址族，没有限制绑定地址。
 
 **位置**
 
-- [`server.rs`](../attachments/server.rs) `MAX_CONCURRENT_HANDSHAKES = 16`
-- [`server.rs`](../attachments/server.rs) `MAX_CONNECTIONS_PER_IP = 8`
-- [`security.rs`](../attachments/security.rs) `HANDSHAKE_TIMEOUT = 5s`
-- [`server.rs`](../attachments/server.rs) `handle_connection`：`server_handshake` 返回前一直持有 `handshake_permit`
+- [`server.rs`](../src/server.rs) `MAX_CONCURRENT_HANDSHAKES = 16`
+- [`server.rs`](../src/server.rs) `MAX_CONNECTIONS_PER_IP = 8`
+- [`security.rs`](../src/security.rs) `HANDSHAKE_TIMEOUT = 5s`
+- [`server.rs`](../src/server.rs) `handle_connection`：`server_handshake` 返回前一直持有 `handshake_permit`
 
 **问题**
 
@@ -114,10 +114,10 @@ systemd 片段限制了地址族，没有限制绑定地址。
 
 **位置**
 
-- [`server.rs`](../attachments/server.rs) 模块文档：MAC / IP / OS 命令不得过信任边界
-- [`client.rs`](../attachments/client.rs) 模块文档：线上消息不含 MAC / IP
-- [`protocol.rs`](../attachments/protocol.rs) `HostSummary { host_id, hostname, ip, mac }`
-- [`server.rs`](../attachments/server.rs) `ListHosts` 发送完整 `summaries`
+- [`server.rs`](../src/server.rs) 模块文档：MAC / IP / OS 命令不得过信任边界
+- [`client.rs`](../src/client.rs) 模块文档：线上消息不含 MAC / IP
+- [`protocol.rs`](../src/protocol.rs) `HostSummary { host_id, hostname, ip, mac }`
+- [`server.rs`](../src/server.rs) `ListHosts` 发送完整 `summaries`
 
 **问题**
 
@@ -139,9 +139,9 @@ systemd 片段限制了地址族，没有限制绑定地址。
 
 **位置**
 
-- [`client.rs`](../attachments/client.rs) `CredentialBundle.shared_secret`
-- [`tui.rs`](../attachments/tui.rs) `issue_credential` 把服务端 PSK 写入每份 bundle
-- [`security.rs`](../attachments/security.rs) `Noise_IKpsk0+psk2`，PSK 参与第一趟与完成转录
+- [`client.rs`](../src/client.rs) `CredentialBundle.shared_secret`
+- [`tui.rs`](../src/tui.rs) `issue_credential` 把服务端 PSK 写入每份 bundle
+- [`security.rs`](../src/security.rs) `Noise_IKpsk0+psk2`，PSK 参与第一趟与完成转录
 
 **问题**
 
@@ -167,8 +167,8 @@ systemd 片段限制了地址族，没有限制绑定地址。
 
 **位置**
 
-- [`server.rs`](../attachments/server.rs) `WAKE_COOLDOWN = 10s`
-- [`server.rs`](../attachments/server.rs) `reserve_wake_targets`：`last_wake` 按 host id 记时间，**不分客户端**
+- [`server.rs`](../src/server.rs) `WAKE_COOLDOWN = 10s`
+- [`server.rs`](../src/server.rs) `reserve_wake_targets`：`last_wake` 按 host id 记时间，**不分客户端**
 
 **问题**
 

@@ -13,8 +13,9 @@ use thiserror::Error;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const MAX_HOSTS: usize = 64;
-pub const MAX_REQUEST_TARGETS: usize = 128;
+pub const MAX_REQUEST_TARGETS: usize = MAX_HOSTS;
 pub const MAX_STATUS_TARGETS: usize = 8;
+pub const MAX_WAKE_TARGETS: usize = 8;
 pub const MAX_HEADERS: usize = 32;
 pub const MAX_HEADER_BYTES: usize = 4 * 1024;
 pub const MAX_ID_BYTES: usize = 64;
@@ -128,7 +129,7 @@ fn deserialize_wake_results<'de, D>(deserializer: D) -> Result<Vec<WakeResult>, 
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec::<D, WakeResult, MAX_REQUEST_TARGETS>(deserializer)
+    deserialize_bounded_vec::<D, WakeResult, MAX_WAKE_TARGETS>(deserializer)
 }
 
 pub fn canonical_headers(mut headers: Vec<Header>) -> Result<Vec<Header>, ProtocolError> {
@@ -353,7 +354,7 @@ impl ClientEnvelope {
                 catalog_version,
                 host_ids,
             } => {
-                validate_catalog_and_targets(*catalog_version, host_ids)?;
+                validate_catalog_and_targets(*catalog_version, host_ids, MAX_STATUS_TARGETS)?;
             }
             ClientOperation::Wake {
                 catalog_version,
@@ -362,7 +363,7 @@ impl ClientEnvelope {
                 boot_nonce,
                 retry_ticket,
             } => {
-                validate_catalog_and_targets(*catalog_version, host_ids)?;
+                validate_catalog_and_targets(*catalog_version, host_ids, MAX_WAKE_TARGETS)?;
                 if !matches!(attempt, 1 | 2) {
                     return Err(ProtocolError::Operation);
                 }
@@ -544,7 +545,7 @@ impl ServerEnvelope {
                     || operation_id != &self.request_id
                     || retry_ticket.iter().all(|byte| *byte == 0)
                     || *deadline_ms == 0
-                    || results.len() > MAX_REQUEST_TARGETS
+                    || results.len() > MAX_WAKE_TARGETS
                     || results.is_empty()
                     || !matches!(attempt, 1 | 2)
                 {
@@ -585,8 +586,9 @@ impl ServerEnvelope {
 fn validate_catalog_and_targets(
     catalog_version: u64,
     host_ids: &[String],
+    maximum: usize,
 ) -> Result<(), ProtocolError> {
-    if catalog_version == 0 || host_ids.is_empty() || host_ids.len() > MAX_REQUEST_TARGETS {
+    if catalog_version == 0 || host_ids.is_empty() || host_ids.len() > maximum {
         return Err(ProtocolError::Operation);
     }
     let mut ids = HashSet::new();

@@ -6,7 +6,7 @@
 use crate::config::HostConfig;
 use std::{
     net::{IpAddr, SocketAddr, SocketAddrV6, TcpStream},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -132,16 +132,31 @@ fn fixed_ping(ip: IpAddr, interface: u32, timeout: Duration) -> bool {
             Ok(Some(status)) => return status.success(),
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(&mut child, "probe timeout");
                 return false;
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_child(&mut child, "probe wait failure");
                 return false;
             }
         }
+    }
+}
+
+fn terminate_child(child: &mut Child, context: &'static str) {
+    if let Err(error) = child.kill()
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        crate::logging::log(
+            crate::logging::Level::Warn,
+            format!("probe child termination failed context={context} error={error}"),
+        );
+    }
+    if let Err(error) = child.wait() {
+        crate::logging::log(
+            crate::logging::Level::Warn,
+            format!("probe child reap failed context={context} error={error}"),
+        );
     }
 }
 

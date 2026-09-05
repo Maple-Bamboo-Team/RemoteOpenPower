@@ -16,7 +16,7 @@ use crate::{
     probe::{PlatformStatusProbe, StatusProbe},
     protocol::{
         ClientEnvelope, ClientOperation, ErrorCode, Header, HostState, HostStatus, HostSummary,
-        MAX_FRAME_BYTES, MAX_REQUEST_TARGETS, MAX_STATUS_TARGETS, PROTOCOL_VERSION, ServerEnvelope,
+        MAX_FRAME_BYTES, MAX_STATUS_TARGETS, MAX_WAKE_TARGETS, PROTOCOL_VERSION, ServerEnvelope,
         ServerEvent, WakeErrorCode, WakeResult, canonical_headers, decode, encode,
     },
     security::{
@@ -332,11 +332,15 @@ impl ConnectionLimiter {
     }
 
     fn release(&self) {
-        let _ = self
+        if self
             .current
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_sub(1)
-            });
+            })
+            .is_err()
+        {
+            log_event("ERROR", "connection permit released below zero");
+        }
     }
 }
 
@@ -737,12 +741,6 @@ impl ServerRuntime {
                 "server runtime requires a server-only configuration".to_owned(),
             ));
         }
-        if config.security.allow_unregistered_clients {
-            return Err(ServerError::Invalid(
-                "allow_unregistered_clients is disabled in the secure runtime; enroll a client key"
-                    .to_owned(),
-            ));
-        }
         let configured_psk = config.secret_key()?;
         if handshake.psk.iter().all(|byte| *byte == 0) {
             return Err(ServerError::Invalid("PSK cannot be all zero".to_owned()));
@@ -767,9 +765,7 @@ impl ServerRuntime {
                 "handshake clock policy does not match configuration".to_owned(),
             ));
         }
-        if handshake.allow_unregistered_clients != config.security.allow_unregistered_clients
-            || handshake.allowed_clients.len() != config.security.allowed_clients.len()
-        {
+        if handshake.allowed_clients.len() != config.security.allowed_clients.len() {
             return Err(ServerError::Invalid(
                 "handshake ACL does not match configuration".to_owned(),
             ));
@@ -792,7 +788,7 @@ impl ServerRuntime {
                 ));
             };
             if runtime_client.static_public_key != key
-                || runtime_client.allowed_hosts.clone() != Some(expected_hosts)
+                || runtime_client.allowed_hosts != expected_hosts
             {
                 return Err(ServerError::Invalid(
                     "handshake ACL entry mismatch".to_owned(),
@@ -955,8 +951,7 @@ impl ServerRuntime {
         path: &Path,
     ) -> Result<HashMap<[u8; 32], ClientAccess>, ServerError> {
         let config = AppConfig::load(path)?;
-        if config.security.allow_unregistered_clients
-            || config.secret_key()? != self.handshake.psk
+        if config.secret_key()? != self.handshake.psk
             || !config.client.address.trim().is_empty()
             || !config.client.client_id.trim().is_empty()
             || !config.client.static_private_key.trim().is_empty()
@@ -1076,27 +1071,27 @@ impl ServerRuntime {
                 HANDSHAKE_RATE_PER_MINUTE,
                 Duration::from_secs(60),
             ) {
-                let _ = stream.shutdown(Shutdown::Both);
+                shutdown_stream(&stream, peer);
                 log_rejection(format!("handshake rate limited peer={peer}"));
                 continue;
             }
             let Some(permit) = self.connections.acquire() else {
-                let _ = stream.shutdown(Shutdown::Both);
+                shutdown_stream(&stream, peer);
                 log_rejection(format!("connection limit reached peer={peer}"));
                 continue;
             };
             let Some(ip_permit) = self.ip_connections.acquire(peer_ip) else {
-                let _ = stream.shutdown(Shutdown::Both);
+                shutdown_stream(&stream, peer);
                 log_rejection(format!("active connection limit reached peer={peer}"));
                 continue;
             };
             let Some(pending_handshake_permit) = self.pending_handshakes.acquire(peer_ip) else {
-                let _ = stream.shutdown(Shutdown::Both);
+                shutdown_stream(&stream, peer);
                 log_rejection(format!("pending handshake limit reached peer={peer}"));
                 continue;
             };
             let Some(handshake_permit) = self.handshakes.acquire() else {
-                let _ = stream.shutdown(Shutdown::Both);
+                shutdown_stream(&stream, peer);
                 log_rejection(format!("handshake concurrency limit reached peer={peer}"));
                 continue;
             };
@@ -1151,16 +1146,6 @@ impl ServerRuntime {
             ));
             return;
         };
-        let handshake_allowed_hosts = handshake.allowed_hosts;
-        // `None` is the explicit unregistered/bootstrap marker.  It is never
-        // interpreted as unrestricted access by this runtime.
-        if handshake_allowed_hosts.is_none() {
-            log_rejection(format!(
-                "authenticated client without ACL peer={peer} key={}",
-                short_key(&client_key)
-            ));
-            return;
-        }
         let Some(initial_allowed_hosts) = self.current_allowed_hosts(&client_key) else {
             log_rejection(format!(
                 "revoked client rejected peer={peer} key={}",
@@ -1226,7 +1211,7 @@ impl ServerRuntime {
                                 "invalid request frame peer={peer} client={}",
                                 client_id
                             ));
-                            let _ = self.send_error(
+                            self.send_error_for_shutdown(
                                 &mut connection,
                                 random_id(),
                                 ErrorCode::BadRequest,
@@ -1243,7 +1228,7 @@ impl ServerRuntime {
                             client_id,
                             short_request(&envelope.request_id)
                         ));
-                        let _ = self.send_error(
+                        self.send_error_for_shutdown(
                             &mut connection,
                             envelope.request_id,
                             ErrorCode::BadRequest,
@@ -1285,7 +1270,7 @@ impl ServerRuntime {
                             client_id,
                             short_request(&envelope.request_id)
                         ));
-                        let _ = self.send_error(
+                        self.send_error_for_shutdown(
                             &mut connection,
                             envelope.request_id,
                             ErrorCode::RateLimited,
@@ -1304,7 +1289,7 @@ impl ServerRuntime {
                             client_id,
                             short_request(&envelope.request_id)
                         ));
-                        let _ = self.send_error(
+                        self.send_error_for_shutdown(
                             &mut connection,
                             envelope.request_id,
                             ErrorCode::Busy,
@@ -1439,7 +1424,7 @@ impl ServerRuntime {
                 short_key(&client_key),
                 short_request(&envelope.request_id)
             ));
-            let _ = self.send_error(
+            self.send_error_for_shutdown(
                 connection,
                 envelope.request_id,
                 ErrorCode::Unauthorized,
@@ -1513,17 +1498,14 @@ impl ServerRuntime {
                     )?;
                     return Ok(None);
                 }
-                let hosts = match self.authorized_hosts(allowed_hosts, &host_ids, true) {
-                    Ok(value) => value,
-                    Err(code) => {
-                        self.send_error(connection, envelope.request_id, code, false)?;
-                        return Ok(None);
-                    }
-                };
-                if hosts.len() > MAX_STATUS_TARGETS {
-                    self.send_error(connection, envelope.request_id, ErrorCode::Busy, true)?;
-                    return Ok(None);
-                }
+                let hosts =
+                    match self.authorized_hosts(allowed_hosts, &host_ids, MAX_STATUS_TARGETS) {
+                        Ok(value) => value,
+                        Err(code) => {
+                            self.send_error(connection, envelope.request_id, code, false)?;
+                            return Ok(None);
+                        }
+                    };
                 let digest = request_digest_context(
                     &envelope.headers,
                     b"status",
@@ -1594,17 +1576,14 @@ impl ServerRuntime {
                     )?;
                     return Ok(None);
                 }
-                let hosts = match self.authorized_hosts(allowed_hosts, &host_ids, false) {
+                let hosts = match self.authorized_hosts(allowed_hosts, &host_ids, MAX_WAKE_TARGETS)
+                {
                     Ok(value) => value,
                     Err(code) => {
                         self.send_error(connection, envelope.request_id, code, false)?;
                         return Ok(None);
                     }
                 };
-                if hosts.len() > MAX_STATUS_TARGETS {
-                    self.send_error(connection, envelope.request_id, ErrorCode::Busy, true)?;
-                    return Ok(None);
-                }
                 let mut sorted_ids = host_ids.clone();
                 sorted_ids.sort_unstable();
                 let digest = request_digest_context(
@@ -1776,13 +1755,10 @@ impl ServerRuntime {
         &self,
         allowed_hosts: &HashSet<String>,
         host_ids: &[String],
-        status: bool,
+        maximum: usize,
     ) -> Result<Vec<HostEntry>, ErrorCode> {
-        if host_ids.is_empty() || host_ids.len() > MAX_REQUEST_TARGETS {
+        if host_ids.is_empty() || host_ids.len() > maximum {
             return Err(ErrorCode::BadRequest);
-        }
-        if status && host_ids.len() > MAX_STATUS_TARGETS {
-            return Err(ErrorCode::Busy);
         }
         let mut seen = HashSet::new();
         let mut output = Vec::with_capacity(host_ids.len());
@@ -1852,6 +1828,18 @@ impl ServerRuntime {
     ) -> Result<(), ServerError> {
         let response = self.make_response(request_id, ServerEvent::Error { code, retryable })?;
         self.send_response(connection, response)
+    }
+
+    fn send_error_for_shutdown(
+        &self,
+        connection: &mut SecureConnection,
+        request_id: [u8; 16],
+        code: ErrorCode,
+        retryable: bool,
+    ) {
+        if let Err(error) = self.send_error(connection, request_id, code, retryable) {
+            log_event("WARN", format!("error response could not be sent: {error}"));
+        }
     }
 
     fn complete_request(&self, key: OperationKey, response: ServerEnvelope) {
@@ -2090,6 +2078,17 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
     false
 }
 
+fn shutdown_stream(stream: &TcpStream, peer: SocketAddr) {
+    if let Err(error) = stream.shutdown(Shutdown::Both)
+        && error.kind() != io::ErrorKind::NotConnected
+    {
+        log_event(
+            "WARN",
+            format!("failed to close rejected connection peer={peer} error={error}"),
+        );
+    }
+}
+
 /// Start the server using a TOML configuration path and optional bind/port
 /// overrides. Interactive setup is the only credential bootstrap path; daemon
 /// startup requires an existing, fully validated file and never writes it.
@@ -2161,7 +2160,6 @@ fn run_server_inner(
         identity,
         Duration::from_secs(config.security.clock_skew_seconds),
         headers,
-        config.security.allow_unregistered_clients,
         &config.security.allowed_clients,
         &host_ids,
     )?;
@@ -2243,7 +2241,6 @@ fn run_server_with_shutdown_inner(
         identity,
         Duration::from_secs(config.security.clock_skew_seconds),
         headers,
-        config.security.allow_unregistered_clients,
         &config.security.allowed_clients,
         &host_ids,
     )?;
@@ -2484,9 +2481,11 @@ mod tests {
             .public;
         let mut config = AppConfig::default();
         config.security.allowed_clients = vec![crate::config::AllowedClient {
-            client_id: "portable-client".to_owned(),
+            client_id: crate::security::client_id_from_public_key(&key),
+            display_label: "Portable client".to_owned(),
             static_public_key: format!("hex:{}", hex::encode(key)),
             allowed_hosts: vec!["lab-pc".to_owned()],
+            issued_credential_file: String::new(),
         }];
         let mut policy = AccessPolicy::new(
             client_access_from_config(&config).expect("build initial access policy"),
@@ -2532,9 +2531,11 @@ mod tests {
             .security
             .allowed_clients
             .push(crate::config::AllowedClient {
-                client_id: "portable-client".to_owned(),
+                client_id: crate::security::client_id_from_public_key(&client_key),
+                display_label: "Portable client".to_owned(),
                 static_public_key: format!("hex:{}", hex::encode(client_key)),
                 allowed_hosts: vec!["lab-pc".to_owned()],
+                issued_credential_file: String::new(),
             });
         config.save(&config_path).expect("save initial config");
 
@@ -2550,7 +2551,6 @@ mod tests {
             identity,
             Duration::from_secs(config.security.clock_skew_seconds),
             Vec::new(),
-            false,
             &config.security.allowed_clients,
             &host_ids,
         )

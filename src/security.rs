@@ -166,9 +166,8 @@ impl std::fmt::Debug for ClientHandshakeConfig {
 pub struct AllowedClientAuth {
     pub client_id: String,
     pub static_public_key: [u8; 32],
-    /// `Some(set)` limits the client to those host IDs.  An empty set means
-    /// deny all; `None` is only used for an explicitly enabled bootstrap mode.
-    pub allowed_hosts: Option<HashSet<String>>,
+    /// An empty set denies access to every host.
+    pub allowed_hosts: HashSet<String>,
 }
 
 pub struct ServerHandshakeConfig {
@@ -176,7 +175,6 @@ pub struct ServerHandshakeConfig {
     pub identity: Identity,
     pub clock_skew: Duration,
     pub headers: Vec<Header>,
-    pub allow_unregistered_clients: bool,
     pub allowed_clients: Vec<AllowedClientAuth>,
 }
 
@@ -188,10 +186,6 @@ impl std::fmt::Debug for ServerHandshakeConfig {
             .field("identity", &self.identity)
             .field("clock_skew", &self.clock_skew)
             .field("header_count", &self.headers.len())
-            .field(
-                "allow_unregistered_clients",
-                &self.allow_unregistered_clients,
-            )
             .field("allowed_client_count", &self.allowed_clients.len())
             .finish()
     }
@@ -203,7 +197,6 @@ impl ServerHandshakeConfig {
         identity: Identity,
         clock_skew: Duration,
         headers: Vec<Header>,
-        allow_unregistered_clients: bool,
         clients: &[AllowedClient],
         host_ids: &HashSet<String>,
     ) -> Result<Self, SecurityError> {
@@ -226,19 +219,14 @@ impl ServerHandshakeConfig {
             if !client_keys.insert(key) {
                 return Err(SecurityError::Unauthorized);
             }
-            let allowed_hosts = if client.allowed_hosts.is_empty() {
-                Some(HashSet::new())
-            } else {
-                let mut hosts = HashSet::new();
-                for host in &client.allowed_hosts {
-                    let id = host.trim().to_ascii_lowercase();
-                    if !host_ids.contains(&id) {
-                        return Err(SecurityError::Unauthorized);
-                    }
-                    hosts.insert(id);
+            let mut allowed_hosts = HashSet::new();
+            for host in &client.allowed_hosts {
+                let id = host.trim().to_ascii_lowercase();
+                if !host_ids.contains(&id) {
+                    return Err(SecurityError::Unauthorized);
                 }
-                Some(hosts)
-            };
+                allowed_hosts.insert(id);
+            }
             allowed_clients.push(AllowedClientAuth {
                 client_id: normalized_id,
                 static_public_key: key,
@@ -250,7 +238,6 @@ impl ServerHandshakeConfig {
             identity,
             clock_skew: clamp_clock_skew(clock_skew),
             headers,
-            allow_unregistered_clients,
             allowed_clients,
         })
     }
@@ -457,8 +444,6 @@ where
 
 pub struct ClientHandshakeResult {
     pub connection: SecureConnection,
-    #[cfg(test)]
-    pub client_id: String,
     pub server_static_public: [u8; 32],
 }
 
@@ -466,7 +451,6 @@ pub struct ServerHandshakeResult {
     pub connection: SecureConnection,
     pub client_id: String,
     pub client_static_public: [u8; 32],
-    pub allowed_hosts: Option<HashSet<String>>,
     pub replay_nonce: [u8; 32],
 }
 
@@ -497,7 +481,12 @@ impl std::fmt::Debug for SecureConnection {
 
 impl SecureConnection {
     fn fail<T>(&mut self, error: SecurityError) -> Result<T, SecurityError> {
-        self.closed = true;
+        if let Err(shutdown_error) = self.close() {
+            crate::logging::log(
+                crate::logging::Level::Warn,
+                format!("secure connection shutdown failed: {shutdown_error}"),
+            );
+        }
         Err(error)
     }
 
@@ -512,9 +501,13 @@ impl SecureConnection {
         self.read_buffer.len()
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&mut self) -> io::Result<()> {
         self.closed = true;
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        match self.stream.shutdown(std::net::Shutdown::Both) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn send_payload(&mut self, payload: &[u8]) -> Result<(), SecurityError> {
@@ -699,8 +692,7 @@ pub fn client_handshake(
     canonical_headers(config.headers.clone())?;
     let expected = config.pinned_server_key.ok_or(SecurityError::PinRequired)?;
     validate_public_key_bytes(&expected)?;
-    // Public config fields are intentionally kept API-compatible, so callers
-    // can construct them directly.  Clamp here as well as in
+    // Clamp here as well as in
     // `ServerHandshakeConfig::from_config` to prevent an accidental
     // `Duration::MAX` from disabling freshness checks.
     let clock_skew = clamp_clock_skew(config.clock_skew);
@@ -760,8 +752,6 @@ pub fn client_handshake(
             peer_addr,
             closed: false,
         },
-        #[cfg(test)]
-        client_id: config.client_id.clone(),
         server_static_public,
     })
 }
@@ -791,8 +781,7 @@ pub fn server_handshake(
     // Reject low-order authenticated points before they reach any ACL or
     // bootstrap branch, avoiding a known-zero X25519 DH result.
     validate_public_key_bytes(&client_static_public)?;
-    let (authorized_client_id, auth) =
-        authorize_client(&hello.client_id, &client_static_public, config)?;
+    let authorized_client_id = authorize_client(&hello.client_id, &client_static_public, config)?;
 
     // The IK first message has already authenticated the client static key
     // and the ACL decision above is complete.  Reserve the client nonce
@@ -845,7 +834,6 @@ pub fn server_handshake(
         },
         client_id: authorized_client_id,
         client_static_public,
-        allowed_hosts: auth,
         replay_nonce: hello.client_nonce,
     })
 }
@@ -854,25 +842,18 @@ fn authorize_client(
     client_id: &str,
     static_public: &[u8; 32],
     config: &ServerHandshakeConfig,
-) -> Result<(String, Option<HashSet<String>>), SecurityError> {
-    let derived_id = client_id_from_public_key(static_public);
+) -> Result<String, SecurityError> {
     if let Some(client) = config
         .allowed_clients
         .iter()
-        // The static public key is the authentication root.  The self-reported
-        // ID is accepted only as a legacy label or the deterministic portable
-        // ID derived from that key; it never selects another ACL entry.
         .find(|client| client.static_public_key == *static_public)
     {
-        if !client.client_id.eq_ignore_ascii_case(client_id)
-            && !derived_id.eq_ignore_ascii_case(client_id)
+        if client.client_id != client_id
+            || client.client_id != client_id_from_public_key(static_public)
         {
             return Err(SecurityError::Unauthorized);
         }
-        return Ok((client.client_id.clone(), client.allowed_hosts.clone()));
-    }
-    if config.allow_unregistered_clients {
-        return Ok((derived_id, None));
+        return Ok(client.client_id.clone());
     }
     Err(SecurityError::Unauthorized)
 }
@@ -1179,6 +1160,7 @@ mod tests {
         let client_identity = Identity::generate().expect("client identity");
         let server_public = server_identity.public;
         let client_public = client_identity.public;
+        let client_id = client_id_from_public_key(&client_public);
         let psk = [42u8; 32];
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let address = listener.local_addr().expect("address");
@@ -1187,11 +1169,10 @@ mod tests {
             identity: server_identity,
             clock_skew: Duration::from_secs(30),
             headers: Vec::new(),
-            allow_unregistered_clients: false,
             allowed_clients: vec![AllowedClientAuth {
-                client_id: "client-a".to_owned(),
+                client_id: client_id.clone(),
                 static_public_key: client_public,
-                allowed_hosts: Some(HashSet::new()),
+                allowed_hosts: HashSet::new(),
             }],
         };
         let replay = ReplayCache::default();
@@ -1203,7 +1184,7 @@ mod tests {
         let client_config = ClientHandshakeConfig {
             psk,
             identity: client_identity,
-            client_id: "client-a".to_owned(),
+            client_id,
             pinned_server_key: Some(server_public),
             clock_skew: Duration::from_secs(30),
             headers: Vec::new(),
@@ -1215,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_key_id_is_accepted_with_legacy_acl_label() {
+    fn portable_key_id_rejects_a_mismatched_acl_identity() {
         use std::net::TcpListener;
 
         let server_identity = Identity::generate().expect("server identity");
@@ -1230,19 +1211,16 @@ mod tests {
             identity: server_identity,
             clock_skew: Duration::from_secs(30),
             headers: Vec::new(),
-            allow_unregistered_clients: false,
-            // This simulates a configuration created before portable IDs were
-            // introduced.  Authorization must still be rooted in the key.
             allowed_clients: vec![AllowedClientAuth {
                 client_id: "school-laptop".to_owned(),
                 static_public_key: client_public,
-                allowed_hosts: Some(HashSet::new()),
+                allowed_hosts: HashSet::new(),
             }],
         };
         let replay = ReplayCache::default();
         let server_thread = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            server_handshake(stream, &server_config, &replay).expect("server handshake")
+            server_handshake(stream, &server_config, &replay)
         });
         let stream = TcpStream::connect(address).expect("connect");
         let client_config = ClientHandshakeConfig {
@@ -1253,10 +1231,8 @@ mod tests {
             clock_skew: Duration::from_secs(30),
             headers: Vec::new(),
         };
-        let client = client_handshake(stream, &client_config).expect("client handshake");
-        let server = server_thread.join().expect("server thread");
-        assert_eq!(client.client_id, client_id_from_public_key(&client_public));
-        assert_eq!(server.client_id, "school-laptop");
+        assert!(client_handshake(stream, &client_config).is_err());
+        assert!(server_thread.join().expect("server thread").is_err());
     }
 
     #[test]
@@ -1267,6 +1243,7 @@ mod tests {
         let client_identity = Identity::generate().expect("client identity");
         let server_public = server_identity.public;
         let client_public = client_identity.public;
+        let client_id = client_id_from_public_key(&client_public);
         let psk = [43u8; 32];
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let address = listener.local_addr().expect("address");
@@ -1275,11 +1252,10 @@ mod tests {
             identity: server_identity,
             clock_skew: Duration::from_secs(30),
             headers: Vec::new(),
-            allow_unregistered_clients: false,
             allowed_clients: vec![AllowedClientAuth {
-                client_id: "client-b".to_owned(),
+                client_id: client_id.clone(),
                 static_public_key: client_public,
-                allowed_hosts: Some(HashSet::new()),
+                allowed_hosts: HashSet::new(),
             }],
         };
         let replay = ReplayCache::default();
@@ -1291,7 +1267,7 @@ mod tests {
         let client_config = ClientHandshakeConfig {
             psk,
             identity: client_identity,
-            client_id: "client-b".to_owned(),
+            client_id,
             pinned_server_key: Some(server_public),
             clock_skew: Duration::from_secs(30),
             headers: Vec::new(),
@@ -1333,7 +1309,7 @@ mod tests {
 
         // Keep the stream write path exercised after the test's direct socket
         // setup on platforms that buffer aggressively.
-        let _ = client.stream.flush();
+        client.stream.flush().expect("flush test client stream");
     }
 
     fn poll_payload_until(connection: &mut SecureConnection) -> Vec<u8> {

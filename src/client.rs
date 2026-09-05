@@ -28,6 +28,8 @@ use thiserror::Error;
 
 pub const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const RECEIPT_TIMEOUT: Duration = Duration::from_secs(15);
+pub const WAKE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const RECONNECT_DELAYS_SECONDS: [u64; 5] = [2, 5, 10, 20, 30];
 const MAX_PENDING_REQUESTS: usize = 16;
@@ -70,9 +72,7 @@ pub enum ClientError {
 #[serde(deny_unknown_fields)]
 pub struct CredentialBundle {
     pub version: u32,
-    /// New bundles store the public-key-derived ID.  Older bundles may carry
-    /// a device label here; runtime code derives the wire ID again from the
-    /// key and never trusts this field for authorization.
+    /// Authentication ID derived from `static_public_key`.
     pub client_id: String,
     /// Human-readable provisioning label.  It is a warning/display hint only;
     /// it is never used as an authentication factor.
@@ -118,7 +118,11 @@ impl CredentialBundle {
         }
         let identity = Identity::from_hex(&self.static_private_key, &self.static_public_key)
             .map_err(|_| ClientError::Credential)?;
-        let _ = crate::config::decode_key(&self.pinned_server_static_key)
+        if self.client_id != crate::security::client_id_from_public_key(&identity.public) {
+            return Err(ClientError::Credential);
+        }
+        crate::config::decode_key(&self.pinned_server_static_key)
+            .map(|_| ())
             .map_err(|_| ClientError::Credential)?;
         let mut probe = crate::config::AppConfig::default();
         probe.security.shared_secret = self.shared_secret.clone();
@@ -166,9 +170,8 @@ impl ClientRuntimeConfig {
         if config.client.address.trim().is_empty() {
             return Err(ClientError::Endpoint);
         }
-        // The wire identity is derived from the static public key.  The
-        // settings file may contain a legacy/display ID, but a mutable host
-        // name is never consulted for authentication or connection setup.
+        // The wire identity is always derived from the static public key. A
+        // mutable machine or display name is never consulted.
         let client_id = crate::security::client_id_from_public_key(&identity.public);
         let headers = headers_from_map(&config.security.custom_headers)?;
         Ok(Self {
@@ -250,6 +253,33 @@ pub fn save_credential_bundle(path: &Path, bundle: &CredentialBundle) -> Result<
     }
     crate::config::write_private_toml(path, &(text + "\n"))?;
     Ok(())
+}
+
+/// Delete the server-side enrollment copy only when it still contains the
+/// credential belonging to the revoked public key. This prevents a stale or
+/// edited path in the server configuration from deleting an unrelated file.
+pub fn remove_issued_credential_bundle(
+    path: &Path,
+    expected_public_key: &str,
+) -> Result<bool, ClientError> {
+    if path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_none_or(|value| !value.ends_with(".credential.toml"))
+    {
+        return Err(ClientError::Credential);
+    }
+    let Some(bundle) = load_credential_bundle(path)? else {
+        return Ok(false);
+    };
+    let identity = bundle.validate()?;
+    let expected =
+        crate::config::decode_key(expected_public_key).map_err(|_| ClientError::Credential)?;
+    if identity.public != expected {
+        return Err(ClientError::Credential);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
 }
 
 fn apply_credential_bundle(
@@ -551,11 +581,11 @@ fn client_actor(
             configured_clock_skew,
         ) {
             ConnectedClientExit::Shutdown => {
-                secure.close();
+                close_connection(&mut secure, "client shutdown");
                 break;
             }
             ConnectedClientExit::Lost { code, message } => {
-                secure.close();
+                close_connection(&mut secure, "connection loss");
                 if !report_connection_failure(&commands, &events, attempt, code, message) {
                     break;
                 }
@@ -563,7 +593,11 @@ fn client_actor(
             }
         }
     }
-    let _ = events.try_send(ClientEvent::Disconnected);
+    send_client_event(
+        &events,
+        ClientEvent::Disconnected,
+        "disconnect notification",
+    );
 }
 
 enum ConnectedClientExit {
@@ -601,28 +635,43 @@ fn run_connected_client(
                     retry_ticket,
                 }) => {
                     if host_ids.is_empty()
-                        || host_ids.len() > crate::protocol::MAX_REQUEST_TARGETS
+                        || host_ids.len() > crate::protocol::MAX_WAKE_TARGETS
                         || operation_id.iter().all(|byte| *byte == 0)
                     {
-                        let _ =
-                            events.try_send(ClientEvent::Error("invalid wake request".to_owned()));
+                        if !send_client_event(
+                            events,
+                            ClientEvent::Error("invalid wake request".to_owned()),
+                            "invalid wake request",
+                        ) {
+                            return ConnectedClientExit::Shutdown;
+                        }
                         continue;
                     }
                     if pending.len() >= MAX_PENDING_OPERATIONS
                         && !pending.contains_key(&operation_id)
                     {
-                        let _ = events.try_send(ClientEvent::Error(
-                            "too many outstanding wake operations".to_owned(),
-                        ));
+                        if !send_client_event(
+                            events,
+                            ClientEvent::Error("too many outstanding wake operations".to_owned()),
+                            "wake operation limit",
+                        ) {
+                            return ConnectedClientExit::Shutdown;
+                        }
                         continue;
                     }
                     if let Some(existing) = pending.get(&operation_id)
                         && (attempt < existing.attempt
                             || (attempt == existing.attempt && existing.receipt_seen))
                     {
-                        let _ = events.try_send(ClientEvent::Error(
-                            "operation_id is already completed or out of order".to_owned(),
-                        ));
+                        if !send_client_event(
+                            events,
+                            ClientEvent::Error(
+                                "operation_id is already completed or out of order".to_owned(),
+                            ),
+                            "wake operation ordering",
+                        ) {
+                            return ConnectedClientExit::Shutdown;
+                        }
                         continue;
                     }
                     let pending_targets: HashSet<String> = host_ids.iter().cloned().collect();
@@ -681,9 +730,11 @@ fn run_connected_client(
                     operation: ClientOperation::ListHosts,
                 };
                 if pending_requests.len() >= MAX_PENDING_REQUESTS {
-                    let _ = events.try_send(ClientEvent::Error(
-                        "too many outstanding requests".to_owned(),
-                    ));
+                    send_client_event(
+                        events,
+                        ClientEvent::Error("too many outstanding requests".to_owned()),
+                        "request limit",
+                    );
                     return ConnectedClientExit::Lost {
                         code: ClientConnectionErrorCode::Protocol,
                         message: "客户端待处理请求超过安全上限".to_owned(),
@@ -741,6 +792,15 @@ fn transport_exit(error: SecurityError) -> ConnectedClientExit {
     }
 }
 
+fn close_connection(secure: &mut crate::security::SecureConnection, context: &'static str) {
+    if let Err(error) = secure.close() {
+        crate::logging::log(
+            crate::logging::Level::Warn,
+            format!("secure connection close failed context={context} error={error}"),
+        );
+    }
+}
+
 fn report_connection_failure(
     commands: &Receiver<ClientCommand>,
     events: &SyncSender<ClientEvent>,
@@ -785,9 +845,13 @@ fn wait_for_reconnect(
             Ok(ClientCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => return false,
             Ok(ClientCommand::Refresh) => {}
             Ok(ClientCommand::Wake { .. }) => {
-                let _ = events.try_send(ClientEvent::Error(
-                    "安全连接尚未建立，未发送唤醒请求".to_owned(),
-                ));
+                if !send_client_event(
+                    events,
+                    ClientEvent::Error("安全连接尚未建立，未发送唤醒请求".to_owned()),
+                    "wake request while disconnected",
+                ) {
+                    return false;
+                }
             }
             Err(RecvTimeoutError::Timeout) => return true,
         }
@@ -846,9 +910,11 @@ fn handle_server_event(
                     first,
                     remaining,
                 ) {
-                    let _ = events.try_send(ClientEvent::Error(
-                        "failed to request host status".to_owned(),
-                    ));
+                    send_client_event(
+                        events,
+                        ClientEvent::Error("failed to request host status".to_owned()),
+                        "status request failure",
+                    );
                     return false;
                 }
             } else {
@@ -998,7 +1064,6 @@ fn handle_server_event(
             if already_online {
                 return true;
             }
-            let _ = operation;
             if let Some(operation) = pending.get_mut(&operation_id) {
                 operation.online.insert(host_id.clone());
             }
@@ -1037,23 +1102,45 @@ fn emit_event(
     events: &SyncSender<ClientEvent>,
     event: ClientEvent,
 ) -> bool {
-    if events.try_send(event).is_ok() {
-        true
-    } else {
-        secure.close();
-        false
+    if !send_client_event(events, event, "authenticated server event") {
+        close_connection(secure, "event queue unavailable");
+        return false;
     }
+    true
 }
 
 fn reject_server_event(
     secure: &mut crate::security::SecureConnection,
     events: &SyncSender<ClientEvent>,
 ) -> bool {
-    secure.close();
-    let _ = events.try_send(ClientEvent::Error(
-        "invalid or unsolicited server response".to_owned(),
-    ));
+    close_connection(secure, "protocol rejection");
+    send_client_event(
+        events,
+        ClientEvent::Error("invalid or unsolicited server response".to_owned()),
+        "protocol rejection",
+    );
     false
+}
+
+fn send_client_event(
+    events: &SyncSender<ClientEvent>,
+    event: ClientEvent,
+    context: &'static str,
+) -> bool {
+    match events.try_send(event) {
+        Ok(()) => true,
+        Err(error) => {
+            let reason = match error {
+                std::sync::mpsc::TrySendError::Full(_) => "queue full",
+                std::sync::mpsc::TrySendError::Disconnected(_) => "receiver disconnected",
+            };
+            crate::logging::log(
+                crate::logging::Level::Warn,
+                format!("client event not delivered context={context} reason={reason}"),
+            );
+            false
+        }
+    }
 }
 
 enum PendingRequest {
@@ -1074,7 +1161,7 @@ fn send_status_batch(
     remaining: VecDeque<Vec<String>>,
 ) -> bool {
     if pending_requests.len() >= MAX_PENDING_REQUESTS || host_ids.is_empty() {
-        secure.close();
+        close_connection(secure, "status request failure");
         return false;
     }
     let request = ClientEnvelope {
@@ -1097,7 +1184,7 @@ fn send_status_batch(
     );
     if secure.send_client_envelope(&request).is_err() {
         pending_requests.remove(&request.request_id);
-        secure.close();
+        close_connection(secure, "server error response");
         return false;
     }
     true
@@ -1127,13 +1214,7 @@ pub fn headers_from_map(map: &BTreeMap<String, String>) -> Result<Vec<Header>, C
 }
 
 pub fn resolve_endpoint(address: &str, port: u16) -> Result<SocketAddr, ClientError> {
-    if port < 1024
-        || address.is_empty()
-        || address.len() > 255
-        || address
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b' ')
-    {
+    if port < 1024 || crate::config::validate_endpoint(address).is_err() {
         return Err(ClientError::Endpoint);
     }
     if let Ok(ip) = address.parse::<IpAddr>() {
@@ -1207,13 +1288,11 @@ mod tests {
     use std::{net::TcpListener, sync::mpsc::RecvTimeoutError};
 
     #[test]
-    fn portable_bundle_validation_uses_key_not_legacy_label() {
+    fn portable_bundle_rejects_an_id_that_does_not_match_its_key() {
         let (static_private_key, static_public_key) = crate::config::generate_identity_pair();
         let (_, server_public_key) = crate::config::generate_identity_pair();
         let bundle = CredentialBundle {
             version: CREDENTIAL_VERSION,
-            // This is a legacy human label, intentionally unrelated to the
-            // current host name.  The key remains the only auth identity.
             client_id: "old-school-laptop".to_owned(),
             device_label: "issued-at-school".to_owned(),
             shared_secret: format!("hex:{}", "11".repeat(32)),
@@ -1222,11 +1301,7 @@ mod tests {
             pinned_server_static_key: server_public_key,
             custom_headers: BTreeMap::new(),
         };
-        let identity = bundle.validate().expect("valid portable bundle");
-        assert_eq!(
-            crate::security::client_id_from_public_key(&identity.public).len(),
-            64
-        );
+        assert!(matches!(bundle.validate(), Err(ClientError::Credential)));
     }
 
     #[test]
@@ -1237,7 +1312,7 @@ mod tests {
         let expected_id = crate::security::client_id_from_public_key(&public);
         let bundle = CredentialBundle {
             version: CREDENTIAL_VERSION,
-            client_id: "mutable-legacy-name".to_owned(),
+            client_id: expected_id.clone(),
             device_label: "original-windows-name".to_owned(),
             shared_secret: format!("hex:{}", "22".repeat(32)),
             static_private_key,
@@ -1255,6 +1330,44 @@ mod tests {
             runtime.device_label.as_deref(),
             Some("original-windows-name")
         );
+    }
+
+    #[test]
+    fn revocation_deletes_only_the_matching_issued_bundle() {
+        let directory = std::env::temp_dir().join(format!(
+            "remote-open-power-revoke-bundle-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&directory).expect("create credential test directory");
+        let path = directory.join("portable.credential.toml");
+        let (static_private_key, static_public_key) = crate::config::generate_identity_pair();
+        let (_, server_public_key) = crate::config::generate_identity_pair();
+        let public = crate::config::decode_key(&static_public_key).expect("client public key");
+        let bundle = CredentialBundle {
+            version: CREDENTIAL_VERSION,
+            client_id: crate::security::client_id_from_public_key(&public),
+            device_label: "portable".to_owned(),
+            shared_secret: format!("hex:{}", "33".repeat(32)),
+            static_private_key,
+            static_public_key: static_public_key.clone(),
+            pinned_server_static_key: server_public_key,
+            custom_headers: BTreeMap::new(),
+        };
+        save_credential_bundle(&path, &bundle).expect("save credential bundle");
+
+        let (_, unrelated_public_key) = crate::config::generate_identity_pair();
+        assert!(matches!(
+            remove_issued_credential_bundle(&path, &unrelated_public_key),
+            Err(ClientError::Credential)
+        ));
+        assert!(path.is_file());
+        assert!(
+            remove_issued_credential_bundle(&path, &static_public_key)
+                .expect("remove matching credential")
+        );
+        assert!(!path.exists());
+        std::fs::remove_dir(&directory).expect("remove credential test directory");
     }
 
     #[test]

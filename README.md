@@ -47,14 +47,16 @@ cargo build --release
 
 直接运行已配置的服务端：
 
-```text
-remote-open-power --server --config /etc/remote-open-power/remote-open-power.toml
+```bash
+sudo -u remote-open-power env REMOTE_OPEN_POWER_LOG_DIR=/var/log/remote-open-power \
+  /usr/local/bin/remote-open-power --server --config /etc/remote-open-power/remote-open-power.toml
 ```
 
-Windows 相对路径也可使用：
+Windows 服务模式要求配置路径为绝对路径：
 
 ```powershell
-.\RemoteOpenPower.exe --server --config .\remote-open-power.toml
+$config = (Resolve-Path .\remote-open-power.toml).Path
+.\RemoteOpenPower.exe --server --config $config
 ```
 
 非交互客户端：
@@ -74,7 +76,9 @@ remote-open-power --help
 
 TUI 的“部署”页按当前平台输出启动方式。Linux 会生成 systemd unit 模板；Windows 当前以前台 daemon 运行，不应把控制台程序直接注册为 SCM 服务。
 
-服务日志同时写入控制台和配置文件旁的 `logs` 目录，文件名为 `YYYY-MM-DD_HHmm_NNN.log`。可通过 `REMOTE_OPEN_POWER_LOG_DIR` 修改目录。日志等级为 `INFO`、`WARN`、`ERROR`、`FATAL`，panic 会附带崩溃报告。
+Linux 服务配置采用 `root:remote-open-power 0640`，配置目录采用 `root:remote-open-power 0750`，日志目录由服务账户持有并采用 `0750`。程序会拒绝其他用户可读、组可写、世界可访问、硬链接或符号链接的私密文件；通过 TUI 重新保存已部署配置时会保留安全的服务属组读取权限。
+
+服务日志同时写入控制台和日志目录，文件名为 `YYYY-MM-DD_HHmm_NNN.log`。交互运行默认使用配置文件旁的 `logs`；Linux systemd 部署必须设置 `REMOTE_OPEN_POWER_LOG_DIR=/var/log/remote-open-power`，该目录由服务账户持有。日志等级为 `INFO`、`WARN`、`ERROR`、`FATAL`，panic 会附带崩溃报告。
 
 ## 构建与测试
 
@@ -97,7 +101,7 @@ cargo clippy --all-targets --locked -- -D warnings
 
 - 客户端只能提交服务端目录中的主机 ID，不能覆盖 MAC、IP、端口或执行系统命令。
 - 客户端身份来自便携静态私钥；显示名称和 Windows 设备名不参与授权。
-- 服务端撤销凭据后会热加载 ACL，并关闭对应的活动连接。
+- 服务端撤销凭据后会热加载 ACL、关闭对应活动连接，并校验身份后删除仍在原位置的签发文件；已复制到客户端的文件无法远程擦除，但会立即失效。
 - “在线”是网络探测结果，不是目标设备的密码学身份证明。
 - 原生 WoL magic packet 在二层网络上没有认证，仍需 VLAN、交换机 ACL 和防火墙限制不可信设备。
 - 服务端不会自行重发。只有客户端收到执行回执、等待 60 秒仍未上线后，才会凭一次性票据申请第二次发送。

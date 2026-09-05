@@ -108,6 +108,20 @@ pub fn install_file(directory: &Path) -> io::Result<FileGuard> {
             "log path must be a regular directory",
         ));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.permissions().mode() & 0o022 != 0
+            || (metadata.uid() != effective_uid && metadata.uid() != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "log directory must be owned by the service user or root and must not be group/world writable",
+            ));
+        }
+    }
 
     let stamp = Local::now().format("%Y-%m-%d_%H%M");
     let (path, file) = (1..=9_999)
@@ -192,14 +206,24 @@ fn emit(level: Level, message: &str) {
     let timestamp = display_timestamp();
     let disk_line = format!("{timestamp} {:<5} {message}", level.as_str());
     let sink_line = format!("{} {message}", level.as_str());
-    let sink = {
+    let (sink, file_error) = {
         let mut state = lock_state();
-        if let Some(target) = state.file.as_mut() {
-            let _ = writeln!(target.file, "{disk_line}");
-            let _ = target.file.flush();
+        let file_error = state
+            .file
+            .as_mut()
+            .and_then(|target| write_line(&mut target.file, &disk_line).err());
+        if file_error.is_some() {
+            state.file = None;
         }
-        state.sink.as_ref().map(|(_, sender)| sender.clone())
+        (
+            state.sink.as_ref().map(|(_, sender)| sender.clone()),
+            file_error,
+        )
     };
+
+    if let Some(error) = file_error {
+        eprintln!("FATAL log file disabled after write failure: {error}");
+    }
 
     if let Some(sender) = sink
         && sender.send(sink_line).is_ok()
@@ -207,8 +231,9 @@ fn emit(level: Level, message: &str) {
         return;
     }
     let mut stdout = io::stdout();
-    let _ = writeln!(stdout, "{disk_line}");
-    let _ = stdout.flush();
+    if let Err(error) = write_line(&mut stdout, &disk_line) {
+        eprintln!("FATAL stdout log write failed: {error}; original={disk_line}");
+    }
 }
 
 fn try_report_from_panic(headline: &str, details: &str) {
@@ -226,37 +251,46 @@ fn try_report_from_panic(headline: &str, details: &str) {
         Ok(mut state) => {
             for line in &lines {
                 let disk_line = format!("{timestamp} {:<5} {line}", Level::Fatal.as_str());
-                if let Some(target) = state.file.as_mut() {
-                    let _ = writeln!(target.file, "{disk_line}");
-                    let _ = target.file.flush();
+                let file_error = state
+                    .file
+                    .as_mut()
+                    .and_then(|target| write_line(&mut target.file, &disk_line).err());
+                if let Some(error) = file_error {
+                    state.file = None;
+                    eprintln!("FATAL panic report file write failed: {error}");
                 }
                 if let Some((_, sender)) = state.sink.as_ref() {
-                    let _ = sender.send(format!("FATAL {line}"));
+                    if sender.send(format!("FATAL {line}")).is_err() {
+                        eprintln!("{disk_line}");
+                    }
                 } else {
-                    let _ = writeln!(io::stderr(), "{disk_line}");
+                    eprintln!("{disk_line}");
                 }
             }
         }
         Err(TryLockError::Poisoned(error)) => {
             let mut state = error.into_inner();
             for line in &lines {
-                if let Some(target) = state.file.as_mut() {
-                    let _ = writeln!(
-                        target.file,
-                        "{timestamp} {:<5} {line}",
-                        Level::Fatal.as_str()
-                    );
-                    let _ = target.file.flush();
+                let disk_line = format!("{timestamp} {:<5} {line}", Level::Fatal.as_str());
+                if let Some(target) = state.file.as_mut()
+                    && let Err(error) = write_line(&mut target.file, &disk_line)
+                {
+                    eprintln!("FATAL poisoned logger file write failed: {error}");
                 }
-                let _ = writeln!(io::stderr(), "FATAL {line}");
+                eprintln!("{disk_line}");
             }
         }
         Err(TryLockError::WouldBlock) => {
             for line in &lines {
-                let _ = writeln!(io::stderr(), "FATAL {line}");
+                eprintln!("{timestamp} {:<5} {line}", Level::Fatal.as_str());
             }
         }
     }
+}
+
+fn write_line(writer: &mut impl Write, line: &str) -> io::Result<()> {
+    writeln!(writer, "{line}")?;
+    writer.flush()
 }
 
 fn normalized_lines(message: &str) -> Vec<String> {

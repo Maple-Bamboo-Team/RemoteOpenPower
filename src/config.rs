@@ -21,21 +21,27 @@ pub const DEFAULT_PORT: u16 = 45_890;
 pub const DEFAULT_CONFIG_FILE: &str = "remote-open-power.toml";
 pub const DEFAULT_CLOCK_SKEW_SECONDS: u64 = 30;
 pub const DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 30;
+pub const DEFAULT_BIND_ADDRESS_V4: &str = "0.0.0.0";
+pub const DEFAULT_BIND_ADDRESS_V6: &str = "::";
 pub const MAX_CONFIG_BYTES: usize = 1_048_576;
-pub const MAX_HOSTS: usize = 64;
+pub const MAX_HOSTS: usize = crate::protocol::MAX_HOSTS;
 pub const MAX_CLIENTS: usize = 128;
-pub const MAX_HEADERS: usize = 32;
-pub const MAX_HEADER_BYTES: usize = 4_096;
+pub const MAX_HEADERS: usize = crate::protocol::MAX_HEADERS;
+pub const MAX_HEADER_BYTES: usize = crate::protocol::MAX_HEADER_BYTES;
+pub const MAX_DISPLAY_LABEL_BYTES: usize = 128;
+pub const MAX_HEADER_NAME_BYTES: usize = 32;
+pub const MAX_HEADER_VALUE_BYTES: usize = 256;
+pub const MAX_ENDPOINT_BYTES: usize = 253;
 pub const MIN_SECRET_BYTES: usize = 32;
-pub const MAX_CLIENT_ID_LEN: usize = 64;
-pub const MAX_ALLOWED_HOSTS: usize = 256;
+pub const MAX_CLIENT_ID_LEN: usize = crate::protocol::MAX_ID_BYTES;
+pub const MAX_ALLOWED_HOSTS: usize = MAX_HOSTS;
 
 fn default_bind_address() -> String {
-    "::".to_owned()
+    DEFAULT_BIND_ADDRESS_V6.to_owned()
 }
 
 fn default_bind_address_v4() -> String {
-    "0.0.0.0".to_owned()
+    DEFAULT_BIND_ADDRESS_V4.to_owned()
 }
 
 fn default_port() -> u16 {
@@ -91,6 +97,12 @@ pub enum ConfigError {
     Invalid(String),
     #[error("cannot serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("{write}; additionally failed to remove temporary file {temp_path}: {cleanup}")]
+    Cleanup {
+        temp_path: PathBuf,
+        write: Box<ConfigError>,
+        cleanup: std::io::Error,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,10 +199,6 @@ pub struct SecurityConfig {
     pub server_static_private_key: String,
     #[serde(default)]
     pub server_static_public_key: String,
-    /// When false (the secure default), a client must be explicitly enrolled
-    /// in `allowed_clients` before it can list or wake anything.
-    #[serde(default)]
-    pub allow_unregistered_clients: bool,
     #[serde(default)]
     pub allowed_clients: Vec<AllowedClient>,
     /// Public targets are disabled by default because this daemon is intended
@@ -212,10 +220,6 @@ impl fmt::Debug for SecurityConfig {
             )
             .field("server_static_private_key", &"<redacted>")
             .field("server_static_public_key", &self.server_static_public_key)
-            .field(
-                "allow_unregistered_clients",
-                &self.allow_unregistered_clients,
-            )
             .field("allowed_clients", &self.allowed_clients)
             .field("allow_public_targets", &self.allow_public_targets)
             .finish()
@@ -231,7 +235,6 @@ impl Default for SecurityConfig {
             custom_headers: BTreeMap::new(),
             server_static_private_key: String::new(),
             server_static_public_key: String::new(),
-            allow_unregistered_clients: false,
             allowed_clients: Vec::new(),
             allow_public_targets: false,
         }
@@ -241,10 +244,18 @@ impl Default for SecurityConfig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowedClient {
+    /// Immutable authentication identity derived from `static_public_key`.
     pub client_id: String,
+    /// Optional operator-facing name. It never participates in authentication.
+    #[serde(default)]
+    pub display_label: String,
     pub static_public_key: String,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Server-side copy created during enrollment. It is management metadata,
+    /// never part of authentication, and is verified before revocation deletes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub issued_credential_file: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,51 +320,21 @@ impl HostConfig {
     }
 
     pub fn validate(&self, allow_public_targets: bool) -> Result<(), ConfigError> {
-        let hostname = self.hostname.trim();
-        if !is_valid_hostname(hostname) {
-            return Err(ConfigError::Invalid(
-                "host name must be an ASCII DNS label (1-64 chars)".to_owned(),
-            ));
-        }
         crate::protocol::validate_id(&self.host_id()).map_err(|_| {
             ConfigError::Invalid(
-                "host name must also be a valid protocol host id (1-64 bytes)".to_owned(),
+                "host ID must use letters, digits, '-' or '_' and be 1-64 bytes".to_owned(),
             )
         })?;
-        if self.display_name.len() > 128 || self.display_name.chars().any(char::is_control) {
+        if self.display_name.len() > MAX_DISPLAY_LABEL_BYTES
+            || self.display_name.chars().any(char::is_control)
+        {
             return Err(ConfigError::Invalid(
                 "display name must be at most 128 bytes and contain no control characters"
                     .to_owned(),
             ));
         }
         parse_mac(&self.mac).map_err(ConfigError::Invalid)?;
-        let ip = self.ip.trim().parse::<IpAddr>().map_err(|_| {
-            ConfigError::Invalid(format!("{} has an invalid IP address", self.hostname))
-        })?;
-        let ip = match ip {
-            IpAddr::V6(value) => value.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-            IpAddr::V4(_) => ip,
-        };
-        let scoped_link_local = matches!(
-            ip,
-            IpAddr::V6(value) if value.is_unicast_link_local() && self.wol_ipv6_interface != 0
-        );
-        if ip.is_unspecified()
-            || ip.is_multicast()
-            || ip.is_loopback()
-            || match ip {
-                IpAddr::V4(value) => {
-                    value.is_broadcast() || value.is_link_local() || value.octets()[0] == 0
-                }
-                IpAddr::V6(value) => value.is_unicast_link_local() && self.wol_ipv6_interface == 0,
-            }
-            || (!allow_public_targets && !is_lan_ip(ip) && !scoped_link_local)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "{} must use a non-loopback LAN IP; link-local IPv6 also requires an interface index",
-                self.hostname
-            )));
-        }
+        validate_target_address(&self.ip, self.wol_ipv6_interface, allow_public_targets)?;
         if !matches!(self.wol_port, 7 | 9) {
             return Err(ConfigError::Invalid(format!(
                 "{} WoL port must be 7 or 9",
@@ -380,8 +361,21 @@ impl HostConfig {
 impl AllowedClient {
     fn validate(&self, host_ids: &std::collections::HashSet<String>) -> Result<(), ConfigError> {
         validate_client_id(&self.client_id)?;
-        decode_key(&self.static_public_key)?;
+        let public_key = decode_key(&self.static_public_key)?;
         validate_public_key(&self.static_public_key, "client static public key")?;
+        if self.client_id != crate::security::client_id_from_public_key(&public_key) {
+            return Err(ConfigError::Invalid(
+                "client_id must be derived from the configured static public key".to_owned(),
+            ));
+        }
+        if self.display_label.len() > MAX_DISPLAY_LABEL_BYTES
+            || self.display_label.chars().any(char::is_control)
+        {
+            return Err(ConfigError::Invalid(
+                "client display label must be at most 128 bytes and contain no control characters"
+                    .to_owned(),
+            ));
+        }
         if self.allowed_hosts.len() > MAX_ALLOWED_HOSTS {
             return Err(ConfigError::Invalid(format!(
                 "client {} has too many allowed hosts",
@@ -397,6 +391,15 @@ impl AllowedClient {
                     self.client_id
                 )));
             }
+        }
+        if !self.issued_credential_file.is_empty()
+            && (self.issued_credential_file.chars().any(char::is_control)
+                || !self.issued_credential_file.ends_with(".credential.toml"))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "client {} has an invalid issued credential path",
+                self.client_id
+            )));
         }
         Ok(())
     }
@@ -763,13 +766,19 @@ pub(crate) fn read_private_text(path: &Path, max_bytes: u64) -> io::Result<Optio
     {
         use std::os::unix::fs::MetadataExt;
         let effective_uid = unsafe { libc::geteuid() };
+        let effective_gid = unsafe { libc::getegid() };
         if metadata.nlink() != 1
-            || metadata.mode() & 0o077 != 0
-            || (metadata.uid() != effective_uid && metadata.uid() != 0)
+            || !unix_private_file_access_is_safe(
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+                effective_uid,
+                effective_gid,
+            )
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "private file owner, mode, or link count is unsafe",
+                "private file must be owner-private or root-owned and read-only to the service group",
             ));
         }
     }
@@ -799,6 +808,69 @@ pub(crate) fn read_private_text(path: &Path, max_bytes: u64) -> io::Result<Optio
     Ok(Some(text))
 }
 
+#[cfg(any(unix, test))]
+fn unix_private_file_access_is_safe(
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    effective_uid: u32,
+    effective_gid: u32,
+) -> bool {
+    // Executable/special bits and any access for "other" are never valid for
+    // configuration or credential material. A private user file is 0600 (or
+    // stricter). A daemon configuration may instead be root:<service> 0640.
+    let owner_private = owner_uid == effective_uid && mode & 0o7_177 == 0;
+    let root_admin = effective_uid == 0 && owner_uid == 0 && mode & 0o7_137 == 0;
+    let service_group_read_only =
+        owner_uid == 0 && owner_gid == effective_gid && mode & 0o7_137 == 0 && mode & 0o040 != 0;
+    owner_private || root_admin || service_group_read_only
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct UnixReplacementMetadata {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+#[cfg(unix)]
+fn unix_replacement_metadata(path: &Path) -> Result<Option<UnixReplacementMetadata>, ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(ConfigError::Invalid(
+            "refusing to replace a linked or non-regular private file".to_owned(),
+        ));
+    }
+
+    let effective_uid = unsafe { libc::geteuid() };
+    let mode = metadata.mode();
+    let owner_is_writable_principal = metadata.uid() == effective_uid || effective_uid == 0;
+    let permissions_are_safe = mode & 0o7_137 == 0;
+    if !owner_is_writable_principal || !permissions_are_safe {
+        return Err(ConfigError::Invalid(
+            "refusing to replace a private file with unsafe ownership or permissions".to_owned(),
+        ));
+    }
+
+    Ok(Some(UnixReplacementMetadata {
+        mode: if mode & 0o040 != 0 { 0o640 } else { 0o600 },
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    }))
+}
+
 /// Write a private TOML document with a create-new temporary file, flush, and
 /// replacement.  Both full server configurations and credential-free client
 /// settings use this path so they share the same crash and permission rules.
@@ -823,14 +895,21 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let mode = parent_metadata.permissions().mode();
-        if mode & 0o022 != 0 {
+        let effective_uid = unsafe { libc::geteuid() };
+        if mode & 0o022 != 0
+            || (parent_metadata.uid() != effective_uid && parent_metadata.uid() != 0)
+        {
             return Err(ConfigError::Invalid(
-                "config directory must not be group/world writable".to_owned(),
+                "config directory must be owned by the current user or root and must not be group/world writable"
+                    .to_owned(),
             ));
         }
     }
+
+    #[cfg(unix)]
+    let replacement_metadata = unix_replacement_metadata(path)?;
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -869,6 +948,36 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
                 path: temp_path.clone(),
                 source,
             })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::PermissionsExt;
+
+            if let Some(metadata) = replacement_metadata {
+                if unsafe { libc::geteuid() } == 0
+                    && unsafe { libc::fchown(file.as_raw_fd(), metadata.uid, metadata.gid) } != 0
+                {
+                    return Err(ConfigError::Write {
+                        path: temp_path.clone(),
+                        source: io::Error::last_os_error(),
+                    });
+                }
+                let mut permissions = file
+                    .metadata()
+                    .map_err(|source| ConfigError::Write {
+                        path: temp_path.clone(),
+                        source,
+                    })?
+                    .permissions();
+                permissions.set_mode(metadata.mode);
+                file.set_permissions(permissions)
+                    .map_err(|source| ConfigError::Write {
+                        path: temp_path.clone(),
+                        source,
+                    })?;
+            }
+        }
         file.sync_all().map_err(|source| ConfigError::Write {
             path: temp_path.clone(),
             source,
@@ -884,7 +993,7 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
                     source,
                 })?
                 .permissions();
-            permissions.set_mode(0o600);
+            permissions.set_mode(replacement_metadata.map_or(0o600, |metadata| metadata.mode));
             fs::set_permissions(&temp_path, permissions).map_err(|source| ConfigError::Write {
                 path: temp_path.clone(),
                 source,
@@ -917,15 +1026,33 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
             source,
         })?;
         #[cfg(unix)]
-        if let Ok(directory) = OpenOptions::new().read(true).open(&parent) {
-            let _ = directory.sync_all();
+        {
+            let directory = OpenOptions::new()
+                .read(true)
+                .open(&parent)
+                .map_err(|source| ConfigError::Write {
+                    path: parent.clone(),
+                    source,
+                })?;
+            directory.sync_all().map_err(|source| ConfigError::Write {
+                path: parent.clone(),
+                source,
+            })?;
         }
         Ok(())
     })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(write) => match fs::remove_file(&temp_path) {
+            Ok(()) => Err(write),
+            Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(write),
+            Err(cleanup) => Err(ConfigError::Cleanup {
+                temp_path,
+                write: Box::new(write),
+                cleanup,
+            }),
+        },
     }
-    write_result
 }
 
 #[cfg(windows)]
@@ -1104,36 +1231,46 @@ pub fn parse_mac(input: &str) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
-fn is_valid_hostname(hostname: &str) -> bool {
-    if hostname.is_empty()
-        || hostname.len() > crate::protocol::MAX_ID_BYTES
-        || hostname.starts_with('.')
-        || hostname.ends_with('.')
-    {
-        return false;
-    }
-    hostname.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && label
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric())
-            && label
-                .as_bytes()
-                .last()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric())
-            && label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    })
-}
-
 fn is_lan_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(value) => value.is_private(),
         IpAddr::V6(value) => value.is_unique_local(),
     }
+}
+
+pub fn validate_target_address(
+    value: &str,
+    ipv6_interface: u32,
+    allow_public_targets: bool,
+) -> Result<IpAddr, ConfigError> {
+    let ip = value
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| ConfigError::Invalid("target has an invalid IP address".to_owned()))?;
+    let ip = match ip {
+        IpAddr::V6(value) => value.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    };
+    let scoped_link_local = matches!(
+        ip,
+        IpAddr::V6(value) if value.is_unicast_link_local() && ipv6_interface != 0
+    );
+    let special = ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_loopback()
+        || match ip {
+            IpAddr::V4(value) => {
+                value.is_broadcast() || value.is_link_local() || value.octets()[0] == 0
+            }
+            IpAddr::V6(value) => value.is_unicast_link_local() && ipv6_interface == 0,
+        };
+    if special || (!allow_public_targets && !is_lan_ip(ip) && !scoped_link_local) {
+        return Err(ConfigError::Invalid(
+            "target must use a non-loopback LAN IP; link-local IPv6 also requires an interface index"
+                .to_owned(),
+        ));
+    }
+    Ok(ip)
 }
 
 fn validate_client_id(client_id: &str) -> Result<(), ConfigError> {
@@ -1148,8 +1285,8 @@ fn validate_client_id(client_id: &str) -> Result<(), ConfigError> {
     })
 }
 
-fn validate_endpoint(address: &str) -> Result<(), ConfigError> {
-    if address.len() > 255
+pub fn validate_endpoint(address: &str) -> Result<(), ConfigError> {
+    if address.len() > MAX_ENDPOINT_BYTES
         || address.is_empty()
         || address
             .bytes()
@@ -1157,6 +1294,32 @@ fn validate_endpoint(address: &str) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::Invalid(
             "client address contains invalid characters".to_owned(),
+        ));
+    }
+    if address.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let hostname = address.strip_suffix('.').unwrap_or(address);
+    if address.len() > MAX_ENDPOINT_BYTES
+        || hostname.is_empty()
+        || !hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        })
+    {
+        return Err(ConfigError::Invalid(
+            "client address must be an IP literal or DNS hostname".to_owned(),
         ));
     }
     Ok(())
@@ -1302,10 +1465,77 @@ mod tests {
     }
 
     #[test]
+    fn host_id_with_underscore_matches_the_tui_and_wire_contract() {
+        let host = HostConfig {
+            hostname: "test_v6".to_owned(),
+            display_name: "IPv6 test".to_owned(),
+            mac: "02:11:22:33:44:55".to_owned(),
+            ip: "fe80::1234".to_owned(),
+            wol_port: 9,
+            probe_timeout_ms: 1_000,
+            probe_port: 0,
+            wol_ipv6_interface: 7,
+        };
+
+        assert!(host.validate(false).is_ok());
+    }
+
+    #[test]
     fn config_and_wire_reject_the_same_reserved_client_ids() {
         for client_id in [".", "..", "_client", "client_"] {
             assert!(validate_client_id(client_id).is_err());
         }
         assert!(validate_client_id("Portable-Client_01").is_ok());
+    }
+
+    #[test]
+    fn unix_private_file_policy_matches_service_deployment_permissions() {
+        let service_uid = 1_001;
+        let service_gid = 1_001;
+
+        assert!(unix_private_file_access_is_safe(
+            0o100600,
+            service_uid,
+            service_gid,
+            service_uid,
+            service_gid,
+        ));
+        assert!(unix_private_file_access_is_safe(
+            0o100640,
+            0,
+            service_gid,
+            service_uid,
+            service_gid,
+        ));
+        assert!(unix_private_file_access_is_safe(0o100640, 0, 20, 0, 0,));
+
+        assert!(!unix_private_file_access_is_safe(
+            0o100640,
+            service_uid,
+            service_gid,
+            service_uid,
+            service_gid,
+        ));
+        assert!(!unix_private_file_access_is_safe(
+            0o100640,
+            0,
+            2_000,
+            service_uid,
+            service_gid,
+        ));
+        assert!(!unix_private_file_access_is_safe(
+            0o100660,
+            0,
+            service_gid,
+            service_uid,
+            service_gid,
+        ));
+        assert!(!unix_private_file_access_is_safe(
+            0o100644,
+            0,
+            service_gid,
+            service_uid,
+            service_gid,
+        ));
     }
 }

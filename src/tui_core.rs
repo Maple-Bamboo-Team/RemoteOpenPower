@@ -7,7 +7,7 @@ use std::{
 };
 
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{
@@ -33,24 +33,24 @@ const TICK_RATE: Duration = Duration::from_millis(100);
 const MIN_WIDTH: u16 = 72;
 const MIN_HEIGHT: u16 = 24;
 const LOG_LIMIT: usize = 200;
-const MAX_HOST_ID_BYTES: usize = 64;
-const MAX_HOST_NAME_BYTES: usize = 128;
+const MAX_HOST_ID_BYTES: usize = crate::protocol::MAX_ID_BYTES;
+const MAX_HOST_NAME_BYTES: usize = crate::config::MAX_DISPLAY_LABEL_BYTES;
 const MAX_MAC_BYTES: usize = 20;
 const MAX_IP_BYTES: usize = 45;
 const MAX_INTERFACE_INDEX_BYTES: usize = 10;
 const MAX_PORT_BYTES: usize = 5;
-const MAX_HEADER_NAME_BYTES: usize = 32;
-const MAX_HEADER_VALUE_BYTES: usize = 256;
-const MAX_CREDENTIAL_LABEL_BYTES: usize = 128;
+const MAX_HEADER_NAME_BYTES: usize = crate::config::MAX_HEADER_NAME_BYTES;
+const MAX_HEADER_VALUE_BYTES: usize = crate::config::MAX_HEADER_VALUE_BYTES;
+const MAX_CREDENTIAL_LABEL_BYTES: usize = crate::config::MAX_DISPLAY_LABEL_BYTES;
 const MAX_OUTPUT_PATH_BYTES: usize = 240;
-const MAX_ENDPOINT_BYTES: usize = 253;
-const MAX_HOSTS: usize = 64;
-const MAX_CLIENTS: usize = 128;
-const MAX_HEADERS: usize = 32;
-const MAX_HEADER_BYTES: usize = 4_096;
+const MAX_ENDPOINT_BYTES: usize = crate::config::MAX_ENDPOINT_BYTES;
+const MAX_HOSTS: usize = crate::config::MAX_HOSTS;
+const MAX_CLIENTS: usize = crate::config::MAX_CLIENTS;
+const MAX_HEADERS: usize = crate::config::MAX_HEADERS;
+const MAX_HEADER_BYTES: usize = crate::config::MAX_HEADER_BYTES;
 const DEFAULT_CUSTOM_BIND: &str = "127.0.0.1";
-const DEFAULT_V4_BIND: &str = "0.0.0.0";
-const DEFAULT_V6_BIND: &str = "::";
+const DEFAULT_V4_BIND: &str = crate::config::DEFAULT_BIND_ADDRESS_V4;
+const DEFAULT_V6_BIND: &str = crate::config::DEFAULT_BIND_ADDRESS_V6;
 const DEFAULT_SERVER_PORT: &str = "45890";
 const DEFAULT_CLOCK_SKEW: &str = "30";
 const DEFAULT_CLIENT_ADDRESS: &str = "";
@@ -120,14 +120,19 @@ fn install_panic_hook() {
 }
 
 fn restore_terminal() {
-    let _ = disable_raw_mode();
-    let _ = execute!(
+    if let Err(error) = disable_raw_mode() {
+        eprintln!("failed to disable terminal raw mode: {error}");
+    }
+    if let Err(error) = execute!(
         stdout(),
         Show,
+        SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen,
         TerminalClear(ClearType::All),
         MoveTo(0, 0)
-    );
+    ) {
+        eprintln!("failed to restore terminal screen: {error}");
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,6 +302,7 @@ struct HostRow {
 
 #[derive(Clone, Debug)]
 struct ClientRow {
+    client_id: String,
     label: String,
     access: String,
 }
@@ -346,6 +352,7 @@ struct App {
     credential_index: usize,
     hosts: Vec<HostRow>,
     clients: Vec<ClientRow>,
+    allow_public_targets: bool,
     logs: VecDeque<LogEntry>,
     started_at: Instant,
     log_scroll: usize,
@@ -414,6 +421,7 @@ impl App {
             credential_index: 0,
             hosts: Vec::new(),
             clients: Vec::new(),
+            allow_public_targets: false,
             logs: VecDeque::new(),
             started_at: now,
             log_scroll: 0,
@@ -679,7 +687,7 @@ impl App {
                     values[4] = "0".into();
                     self.editor_inputs[4] = Input::new("0".into());
                 }
-                if let Err(message) = validate_host_form(&values) {
+                if let Err(message) = validate_host_form(&values, self.allow_public_targets) {
                     self.notify(message);
                     return;
                 }
@@ -1107,7 +1115,7 @@ impl App {
 
     fn open_credential_issue(&mut self, index: Option<usize>) {
         self.issue_edit_index = index;
-        self.issue_field = 0;
+        self.issue_field = if index.is_some() { 1 } else { 0 };
         self.issue_host_index = 0;
         let number = self.clients.len() + 1;
         let label = index.and_then(|i| self.clients.get(i)).map_or_else(
@@ -1135,6 +1143,8 @@ impl App {
 
         match key.code {
             KeyCode::Esc => self.screen = Screen::Credentials,
+            KeyCode::Tab if self.issue_edit_index.is_some() => self.issue_field = 1,
+            KeyCode::BackTab if self.issue_edit_index.is_some() => self.issue_field = 1,
             KeyCode::Tab => self.change_issue_field((self.issue_field + 1) % 3),
             KeyCode::BackTab => self.change_issue_field((self.issue_field + 2) % 3),
             KeyCode::Up if self.issue_field == 1 => {
@@ -1152,6 +1162,7 @@ impl App {
                 let select = self.issue_selected.iter().any(|selected| !selected);
                 self.issue_selected.fill(select);
             }
+            KeyCode::Enter if self.issue_edit_index.is_some() => {}
             KeyCode::Enter if self.issue_field < 2 => self.change_issue_field(self.issue_field + 1),
             KeyCode::Enter => {}
             _ if self.issue_field == 0 => {
@@ -1256,13 +1267,34 @@ impl App {
                     (self.client_host_index + 1).min(self.hosts.len().saturating_sub(1))
             }
             KeyCode::Char(' ') if !self.hosts.is_empty() => {
-                self.hosts[self.client_host_index].selected =
-                    !self.hosts[self.client_host_index].selected
+                if self.hosts[self.client_host_index].selected {
+                    self.hosts[self.client_host_index].selected = false;
+                } else if self.hosts.iter().filter(|host| host.selected).count()
+                    >= crate::protocol::MAX_WAKE_TARGETS
+                {
+                    self.notify(format!(
+                        "单次最多选择 {} 台主机",
+                        crate::protocol::MAX_WAKE_TARGETS
+                    ));
+                } else {
+                    self.hosts[self.client_host_index].selected = true;
+                }
             }
             KeyCode::Char('a') => {
-                let select = self.hosts.iter().any(|host| !host.selected);
-                for host in &mut self.hosts {
-                    host.selected = select;
+                if self.hosts.iter().all(|host| host.selected) {
+                    for host in &mut self.hosts {
+                        host.selected = false;
+                    }
+                } else {
+                    for (index, host) in self.hosts.iter_mut().enumerate() {
+                        host.selected = index < crate::protocol::MAX_WAKE_TARGETS;
+                    }
+                    if self.hosts.len() > crate::protocol::MAX_WAKE_TARGETS {
+                        self.notify(format!(
+                            "已选择前 {} 台；单次唤醒达到上限",
+                            crate::protocol::MAX_WAKE_TARGETS
+                        ));
+                    }
                 }
             }
             KeyCode::Char('r') => {
@@ -1359,90 +1391,26 @@ fn normalize_defaulted_input(input: &mut Input, default: &str) {
     });
 }
 
-fn validate_host_form(values: &[String]) -> Result<(), String> {
+fn validate_host_form(values: &[String], allow_public_targets: bool) -> Result<(), String> {
     if values.len() != 5 || values[..4].iter().any(|value| value.trim().is_empty()) {
         return Err("Host ID、名称、MAC 和 IP 都不能为空".into());
     }
     let host_id = &values[0];
-    if host_id.len() > MAX_HOST_ID_BYTES
-        || !host_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        || !host_id
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_alphanumeric())
-        || !host_id
-            .chars()
-            .last()
-            .is_some_and(|character| character.is_ascii_alphanumeric())
-    {
+    if crate::protocol::validate_id(host_id).is_err() {
         return Err("Host ID 只能使用字母、数字、-、_，且首尾必须是字母或数字".into());
     }
     if values[1].len() > MAX_HOST_NAME_BYTES || values[1].chars().any(char::is_control) {
         return Err("显示名称过长或包含控制字符".into());
     }
-    if !valid_mac(&values[2]) {
+    if crate::config::parse_mac(&values[2]).is_err() {
         return Err("MAC 地址格式无效，应包含 12 个十六进制数字".into());
     }
-    let ip = values[3]
-        .parse::<IpAddr>()
-        .map_err(|_| "IP 地址格式无效".to_owned())?;
-    let ip = match ip {
-        IpAddr::V6(value) => value.to_ipv4_mapped().map_or(ip, IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    };
     let interface = values[4]
         .parse::<u32>()
         .map_err(|_| "IPv6 网卡索引必须是 0 到 4294967295 的整数".to_owned())?;
-    let is_lan = match ip {
-        IpAddr::V4(value) => value.is_private(),
-        IpAddr::V6(value) => {
-            value.is_unique_local() || (value.is_unicast_link_local() && interface != 0)
-        }
-    };
-    let is_special = ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || match ip {
-            IpAddr::V4(value) => {
-                value.is_broadcast() || value.is_link_local() || value.octets()[0] == 0
-            }
-            IpAddr::V6(value) => value.is_unicast_link_local() && interface == 0,
-        };
-    if is_special || !is_lan {
-        return Err("目标 IP 必须是局域网地址；链路本地 IPv6 还必须填写网卡索引".into());
-    }
+    crate::config::validate_target_address(&values[3], interface, allow_public_targets)
+        .map_err(|_| "目标 IP 必须是局域网地址；链路本地 IPv6 还必须填写网卡索引".to_owned())?;
     Ok(())
-}
-
-fn valid_mac(value: &str) -> bool {
-    if value.is_empty() || value.len() > MAX_MAC_BYTES {
-        return false;
-    }
-    let mut compact = String::with_capacity(12);
-    for character in value.chars() {
-        if character.is_ascii_hexdigit() {
-            compact.push(character);
-        } else if !matches!(character, '-' | ':' | '.' | ' ') {
-            return false;
-        }
-    }
-    if compact.len() != 12
-        || !compact
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    let mut bytes = [0_u8; 6];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let Ok(parsed) = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16) else {
-            return false;
-        };
-        *byte = parsed;
-    }
-    bytes != [0; 6] && bytes != [0xff; 6] && bytes[0] & 1 == 0
 }
 
 fn validate_listen_address(value: &str, ipv6: Option<bool>) -> Result<(), String> {
@@ -1461,33 +1429,8 @@ fn validate_listen_address(value: &str, ipv6: Option<bool>) -> Result<(), String
 }
 
 fn validate_header(name: &str, value: &str) -> Result<(), String> {
-    if name.is_empty() || value.is_empty() {
-        return Err("Header 名称和值都不能为空".into());
-    }
-    if name.len() > MAX_HEADER_NAME_BYTES
-        || !name.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-        })
-        || !name
-            .chars()
-            .next()
-            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
-        || !name
-            .chars()
-            .last()
-            .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
-    {
-        return Err("Header 名称只能使用小写字母、数字和中间连字符".into());
-    }
-    if name.starts_with("rop-") || name.starts_with("x-rop-") {
-        return Err("rop-* 与 x-rop-* 是保留 Header 名称".into());
-    }
-    if value.len() > MAX_HEADER_VALUE_BYTES
-        || !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
-    {
-        return Err("Header 值必须是不超过 256 字节的可打印 ASCII".into());
-    }
-    Ok(())
+    crate::config::validate_header(name, value)
+        .map_err(|error| format!("Header 无效: {error}"))
 }
 
 fn validate_credential_form(label: &str, output: &str, allowed: usize) -> Result<(), String> {
@@ -1514,38 +1457,19 @@ fn validate_credential_form(label: &str, output: &str, allowed: usize) -> Result
     Ok(())
 }
 
-fn validate_client_endpoint(address: &str, port: &str) -> Result<(), String> {
-    if address.is_empty() {
-        return Err("服务端地址不能为空".into());
+fn validate_credential_edit(allowed: usize) -> Result<(), String> {
+    if allowed == 0 {
+        Err("至少允许一台主机".into())
+    } else {
+        Ok(())
     }
-    if address.len() > MAX_ENDPOINT_BYTES || !valid_endpoint_host(address) {
-        return Err("服务端地址必须是有效的 IP 或 DNS 主机名，不能包含协议或路径".into());
-    }
-    parse_port(port)?;
-    Ok(())
 }
 
-fn valid_endpoint_host(value: &str) -> bool {
-    if value.parse::<IpAddr>().is_ok() {
-        return true;
-    }
-    let hostname = value.strip_suffix('.').unwrap_or(value);
-    !hostname.is_empty()
-        && hostname.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
-                && label
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character.is_ascii_alphanumeric())
-                && label
-                    .chars()
-                    .last()
-                    .is_some_and(|character| character.is_ascii_alphanumeric())
-        })
+fn validate_client_endpoint(address: &str, port: &str) -> Result<(), String> {
+    crate::config::validate_endpoint(address)
+        .map_err(|_| "服务端地址必须是有效的 IP 或 DNS 主机名，不能包含协议或路径".to_owned())?;
+    parse_port(port)?;
+    Ok(())
 }
 
 fn parse_port(value: &str) -> Result<u16, String> {
@@ -1713,6 +1637,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         (Screen::HeaderEditor, true) => "Tab字段  Enter继续/保存  Esc取消",
         (Screen::Credentials, true) => "1..5切页  ↑↓选择  n签发  e修改  d撤销  Esc返回",
+        (Screen::CredentialIssue, true) if app.issue_edit_index.is_some() => {
+            "↑↓选择  Space勾选  Enter保存权限  Esc取消"
+        }
         (Screen::CredentialIssue, true) => "Tab区域  Space选择  Ctrl+S签发  Esc取消",
         (Screen::ServerRunning, true) => "1..5切页  PgUp/PgDn滚动  End跟随  c清屏  q停止",
         (Screen::ClientConnect, true) => "Tab字段  Enter连接  Esc返回",
@@ -1721,7 +1648,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         {
             "自动重连中  Esc取消"
         }
-        (Screen::ClientHosts, true) => "↑↓选择  Space勾选  a全选  r刷新  Enter唤醒  Esc断开",
+        (Screen::ClientHosts, true) => "↑↓选择  Space勾选  a批选  r刷新  Enter唤醒  Esc断开",
         (Screen::Wake, true) => "等待回执/在线  Enter返回  Esc取消",
         (Screen::SaveExit, true) => "1..5切页  s再次保存  q退出  Esc返回",
         (Screen::ServerHome, false) => {
@@ -1733,6 +1660,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         (Screen::HeaderEditor, false) => "Tab/↑↓ 切换字段   Enter 继续/保存   Esc 取消",
         (Screen::Credentials, false) => "1..5 切页   ↑↓ 选择   n 签发   e/Enter 修改权限   d 撤销",
+        (Screen::CredentialIssue, false) if app.issue_edit_index.is_some() => {
+            "↑↓ 选择   Space 勾选   Enter 保存权限   Esc 取消"
+        }
         (Screen::CredentialIssue, false) => {
             "Tab 切换区域   Space 选择   Ctrl+S/Enter 签发   Esc 取消"
         }
@@ -1746,7 +1676,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "正在自动重连   Esc 取消并返回"
         }
         (Screen::ClientHosts, false) => {
-            "↑↓ 选择   Space 勾选   a 全选   r 刷新   Enter 唤醒   Esc 断开"
+            "↑↓ 选择   Space 勾选   a 批量选择   r 刷新   Enter 唤醒   Esc 断开"
         }
         (Screen::Wake, false) => {
             "等待服务端回执与在线状态   Enter 完成后返回   Esc 取消等待"
@@ -2157,20 +2087,13 @@ fn render_host_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "IPv6 网卡索引 (0=自动)",
     ];
     for (index, row) in rows.iter().enumerate() {
-        let border = if app.editor_field == index {
-            CYAN
-        } else {
-            PANEL
-        };
-        frame.render_widget(
-            Paragraph::new(app.editor_inputs[index].value()).block(
-                Block::default()
-                    .title(format!(" {} ", labels[index]))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Plain)
-                    .border_style(Style::default().fg(border)),
-            ),
+        render_input(
+            frame,
             *row,
+            labels[index],
+            &app.editor_inputs[index],
+            app.editor_field == index,
+            app.modal.is_none() && app.editor_field == index,
         );
     }
 }
@@ -2208,6 +2131,23 @@ fn render_server_settings(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (app.settings_field < app.setting_field_count()).then_some(app.settings_field),
     );
     frame.render_stateful_widget(settings_table, settings, &mut settings_state);
+    if app.modal.is_none()
+        && app.settings_editing
+        && let Some(input) = app.setting_input(app.active_setting_field())
+    {
+        let inner = settings.inner(Margin::new(1, 1));
+        let value_x = inner
+            .x
+            .saturating_add(2)
+            .saturating_add(inner.width.saturating_mul(42) / 100)
+            .saturating_add(1);
+        let value_width = inner.right().saturating_sub(value_x);
+        let row_y = inner
+            .y
+            .saturating_add(1)
+            .saturating_add(app.settings_field as u16);
+        set_inline_input_cursor(frame, value_x, row_y, value_width, input);
+    }
 
     let header_rows = app
         .headers
@@ -2316,15 +2256,17 @@ fn render_header_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         name,
         "Header 名称",
-        app.header_inputs[0].value(),
+        &app.header_inputs[0],
         app.header_editor_field == 0,
+        app.modal.is_none() && app.header_editor_field == 0,
     );
     render_input(
         frame,
         value,
         "Header 值",
-        app.header_inputs[1].value(),
+        &app.header_inputs[1],
         app.header_editor_field == 1,
+        app.modal.is_none() && app.header_editor_field == 1,
     );
 }
 
@@ -2363,22 +2305,39 @@ fn render_credentials(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_credential_issue(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let [identity, hosts, output] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(8),
-        Constraint::Length(5),
-    ])
+    let editing = app.issue_edit_index.is_some();
+    let [identity, hosts, output] = Layout::vertical(if editing {
+        [
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(2),
+        ]
+    } else {
+        [
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(5),
+        ]
+    })
     .spacing(1)
     .areas(area);
 
     let [label] = Layout::vertical([Constraint::Length(3)]).areas(identity);
-    render_input(
-        frame,
-        label,
-        "凭据标签",
-        app.issue_label_input.value(),
-        app.issue_field == 0,
-    );
+    if editing {
+        frame.render_widget(
+            Paragraph::new(app.issue_label_input.value()).block(panel(" 凭据标签（不可变） ")),
+            label,
+        );
+    } else {
+        render_input(
+            frame,
+            label,
+            "凭据标签",
+            &app.issue_label_input,
+            app.issue_field == 0,
+            app.modal.is_none() && app.issue_field == 0,
+        );
+    }
 
     let host_rows = app.hosts.iter().enumerate().map(|(index, host)| {
         Row::new([
@@ -2418,27 +2377,39 @@ fn render_credential_issue(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     frame.render_stateful_widget(host_table, hosts, &mut host_state);
 
-    let [path, summary] =
-        Layout::vertical([Constraint::Length(3), Constraint::Length(2)]).areas(output);
-    render_input(
-        frame,
-        path,
-        "输出文件",
-        app.issue_output_input.value(),
-        app.issue_field == 2,
-    );
     let selected = app
         .issue_selected
         .iter()
         .filter(|selected| **selected)
         .count();
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("已选  ", Style::default().fg(MUTED)),
-            Span::styled(format!("{selected} 台主机"), Style::default().fg(CYAN)),
-        ])),
-        summary,
-    );
+    if editing {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("已选  ", Style::default().fg(MUTED)),
+                Span::styled(format!("{selected} 台主机"), Style::default().fg(CYAN)),
+                Span::styled("    Enter 保存权限", Style::default().fg(MUTED)),
+            ])),
+            output,
+        );
+    } else {
+        let [path, summary] =
+            Layout::vertical([Constraint::Length(3), Constraint::Length(2)]).areas(output);
+        render_input(
+            frame,
+            path,
+            "输出文件",
+            &app.issue_output_input,
+            app.issue_field == 2,
+            app.modal.is_none() && app.issue_field == 2,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("已选  ", Style::default().fg(MUTED)),
+                Span::styled(format!("{selected} 台主机"), Style::default().fg(CYAN)),
+            ])),
+            summary,
+        );
+    }
 }
 
 fn render_server_running(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2519,15 +2490,17 @@ fn render_client_connect(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         address,
         "服务端地址",
-        app.address_input.value(),
+        &app.address_input,
         app.connect_field == 0,
+        app.modal.is_none() && app.connect_field == 0,
     );
     render_input(
         frame,
         port,
         "服务端端口",
-        app.port_input.value(),
+        &app.port_input,
         app.connect_field == 1,
+        app.modal.is_none() && app.connect_field == 1,
     );
     frame.render_widget(
         Paragraph::new(vec![
@@ -2813,55 +2786,8 @@ fn render_save_exit(frame: &mut Frame<'_>, app: &App, area: Rect) {
         summary,
     );
 
-    #[cfg(windows)]
-    let default_deployment_text = Text::from(vec![
-        Line::from(Span::styled(
-            "Windows 启动指令",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(
-            "RemoteOpenPower.exe --server --config C:\\ProgramData\\RemoteOpenPower\\remote-open-power.toml",
-        ),
-    ]);
-    #[cfg(target_os = "linux")]
-    let default_deployment_text = Text::from(vec![
-        Line::from(Span::styled(
-            "Linux 启动指令",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(
-            "./RemoteOpenPower --server --config /etc/remote-open-power/remote-open-power.toml",
-        ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "systemd 部署",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("sudo install -Dm0755 ./RemoteOpenPower /usr/local/bin/remote-open-power"),
-        Line::from("sudo install -d -o root -g remote-open-power -m0750 /etc/remote-open-power"),
-        Line::from(
-            "sudo install -o root -g remote-open-power -m0640 ./remote-open-power.toml /etc/remote-open-power/remote-open-power.toml",
-        ),
-        Line::from("sudo systemctl daemon-reload && sudo systemctl enable --now remote-open-power"),
-    ]);
-    #[cfg(all(unix, not(target_os = "linux")))]
-    let default_deployment_text = Text::from(vec![
-        Line::from(Span::styled(
-            "Unix 启动指令",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("./RemoteOpenPower --server --config ./remote-open-power.toml"),
-        Line::from(""),
-        Line::from("当前平台不生成 Linux systemd unit。"),
-    ]);
-    #[cfg(not(any(windows, unix)))]
-    let default_deployment_text = Text::from(vec![Line::from("当前平台没有可用的部署模板。")]);
     let deployment_text = if app.deployment_lines.is_empty() {
-        default_deployment_text
+        Text::from(Line::from("部署信息尚未生成，请返回后重新进入部署页。"))
     } else {
         Text::from(
             app.deployment_lines
@@ -2907,7 +2833,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: Modal, area: Rect) {
         Modal::RevokeCredential => (
             " 撤销客户端凭据 ",
             format!(
-                "确认撤销 {}？",
+                "确认撤销 {} 并删除服务端签发文件？客户端副本会立即失效。",
                 app.clients
                     .get(app.credential_index)
                     .map_or("当前凭据", |client| client.label.as_str())
@@ -3001,18 +2927,22 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Screen::Credentials => &[
             ("↑ / ↓", "选择已签发凭据"),
             ("n", "打开完整凭据签发表单"),
-            ("e / Enter", "修改所选凭据的标签和主机权限"),
+            ("e / Enter", "修改所选凭据的主机权限"),
             ("d", "撤销所选凭据"),
             ("Esc", "返回开机项页面"),
+        ],
+        Screen::CredentialIssue if app.issue_edit_index.is_some() => &[
+            ("↑ / ↓ / Space", "选择并勾选允许访问的主机"),
+            ("a", "全选或取消全选"),
+            ("Enter / Ctrl+S", "保存主机权限"),
+            ("Esc", "取消修改"),
+            ("身份规则", "已签发身份、标签和文件保持不变"),
         ],
         Screen::CredentialIssue => &[
             ("Tab", "切换标签、主机权限和输出文件"),
             ("↑ / ↓ / Space", "选择并勾选允许访问的主机"),
             ("a", "全选或取消全选"),
-            (
-                "Ctrl+S / Enter",
-                "校验后签发或更新权限",
-            ),
+            ("Ctrl+S / Enter", "校验并签发凭据"),
             ("Esc", "取消签发"),
             ("身份规则", "标签和设备名不参与认证；便携私钥才是身份"),
         ],
@@ -3032,7 +2962,10 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ],
         Screen::ClientHosts => &[
             ("↑ / ↓", "选择主机"),
-            ("Space / a", "勾选当前主机或切换全选"),
+            (
+                "Space / a",
+                "勾选当前主机或按协议上限批量选择",
+            ),
             (
                 "r",
                 "从服务端刷新状态",
@@ -3079,16 +3012,49 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn render_input(frame: &mut Frame<'_>, area: Rect, label: &str, value: &str, active: bool) {
+fn render_input(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &str,
+    input: &Input,
+    active: bool,
+    cursor_visible: bool,
+) {
+    let cursor_width = area.width.saturating_sub(3).max(1) as usize;
+    let scroll = input.visual_scroll(cursor_width);
     frame.render_widget(
-        Paragraph::new(value).block(
-            Block::default()
-                .title(format!(" {label} "))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if active { CYAN } else { PANEL })),
-        ),
+        Paragraph::new(input.value())
+            .scroll((0, scroll as u16))
+            .block(
+                Block::default()
+                    .title(format!(" {label} "))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if active { CYAN } else { PANEL })),
+            ),
         area,
     );
+    if cursor_visible {
+        let cursor = input.visual_cursor().max(scroll).saturating_sub(scroll);
+        frame.set_cursor_position((
+            area.x
+                .saturating_add(1)
+                .saturating_add(cursor.min(cursor_width) as u16),
+            area.y.saturating_add(1),
+        ));
+    }
+}
+
+fn set_inline_input_cursor(
+    frame: &mut Frame<'_>,
+    x: u16,
+    y: u16,
+    width: u16,
+    input: &Input,
+) {
+    let cursor_width = width.saturating_sub(1).max(1) as usize;
+    let scroll = input.visual_scroll(cursor_width);
+    let cursor = input.visual_cursor().max(scroll).saturating_sub(scroll);
+    frame.set_cursor_position((x.saturating_add(cursor.min(cursor_width) as u16), y));
 }
 
 fn panel(title: &str) -> Block<'_> {

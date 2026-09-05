@@ -38,7 +38,7 @@ struct ProductionApp {
     wake: Option<ActualWake>,
     server_started: bool,
     server_shutdown: Option<Arc<AtomicBool>>,
-    server_thread: Option<JoinHandle<()>>,
+    server_thread: Option<JoinHandle<Result<(), server::ServerError>>>,
     server_log_rx: Option<Receiver<String>>,
     server_log_guard: Option<server::LogSinkGuard>,
     server_metrics: server::ServerMetrics,
@@ -60,8 +60,13 @@ pub fn run(config_path: &Path) -> Result<(), String> {
     enable_raw_mode().map_err(|error| format!("无法启用终端模式: {error}"))?;
     let _guard = TerminalGuard;
     let mut output = stdout();
-    execute!(output, EnterAlternateScreen, Hide)
-        .map_err(|error| format!("无法进入备用屏幕: {error}"))?;
+    execute!(
+        output,
+        EnterAlternateScreen,
+        SetCursorStyle::BlinkingUnderScore,
+        Hide
+    )
+    .map_err(|error| format!("无法进入备用屏幕: {error}"))?;
     let backend = CrosstermBackend::new(output);
     let mut terminal =
         Terminal::new(backend).map_err(|error| format!("无法初始化 TUI: {error}"))?;
@@ -184,7 +189,12 @@ impl ProductionApp {
                     format!("{} 台主机", client.allowed_hosts.len())
                 };
                 ClientRow {
-                    label: client.client_id.clone(),
+                    client_id: client.client_id.clone(),
+                    label: if client.display_label.trim().is_empty() {
+                        client.client_id.clone()
+                    } else {
+                        client.display_label.clone()
+                    },
                     access,
                 }
             })
@@ -205,6 +215,7 @@ impl ProductionApp {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
+        self.app.allow_public_targets = self.config.security.allow_public_targets;
         self.app.header_index = self
             .app
             .header_index
@@ -364,7 +375,11 @@ impl ProductionApp {
             Screen::CredentialIssue
                 if (key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('s'))
-                    || (plain && key.code == KeyCode::Enter && self.app.issue_field == 2) =>
+                    || (plain
+                        && key.code == KeyCode::Enter
+                        && (self.app.issue_field == 2
+                            || (self.app.issue_edit_index.is_some()
+                                && self.app.issue_field == 1))) =>
             {
                 self.issue_credential();
                 true
@@ -385,8 +400,11 @@ impl ProductionApp {
                 if self.app.connection_phase != ClientConnectionPhase::Connected {
                     self.app.notify("安全连接尚未建立，客户端会自动重试".into());
                 } else if let Some(handle) = self.client.as_ref() {
-                    let _ = handle.commands.send(client::ClientCommand::Refresh);
-                    self.app.notify("正在刷新主机目录".into());
+                    if handle.commands.send(client::ClientCommand::Refresh).is_ok() {
+                        self.app.notify("正在刷新主机目录".into());
+                    } else {
+                        self.app.notify("客户端连接任务已退出，无法刷新".into());
+                    }
                 } else {
                     self.app.notify("尚未建立安全连接".into());
                 }
@@ -408,12 +426,6 @@ impl ProductionApp {
                     self.app.handle_event(Event::Key(key));
                     self.wake = None;
                 }
-                true
-            }
-            Screen::Wake
-                if plain && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('t')) =>
-            {
-                self.app.notify("正在等待服务端回执和目标状态".into());
                 true
             }
             Screen::Wake if plain && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) => {
@@ -451,22 +463,67 @@ impl ProductionApp {
                 && self.app.screen == Screen::Credentials);
         let entered_deployment =
             self.app.screen == Screen::SaveExit && before_screen != Screen::SaveExit;
-        if before_modal == Some(Modal::RevokeCredential)
+        let revoked_client = if before_modal == Some(Modal::RevokeCredential)
             && self.app.modal.is_none()
             && self.app.screen == Screen::Credentials
         {
+            let revoked = self
+                .client_acl
+                .iter()
+                .find(|client| {
+                    !self
+                        .app
+                        .clients
+                        .iter()
+                        .any(|view| view.client_id == client.client_id)
+                })
+                .cloned();
             self.client_acl.retain(|client| {
                 self.app
                     .clients
                     .iter()
-                    .any(|view| view.label.eq_ignore_ascii_case(&client.client_id))
+                    .any(|view| view.client_id == client.client_id)
             });
-        }
+            revoked
+        } else {
+            None
+        };
         if changed_server_data
             || entered_deployment
             || (key.code == KeyCode::Char('q') && self.app.screen == Screen::SaveExit)
         {
-            self.persist_server_with_notice();
+            let saved = self.persist_server_with_notice();
+            if saved && let Some(revoked) = revoked_client.as_ref() {
+                self.delete_revoked_credential_file(revoked);
+            }
+        }
+    }
+
+    fn delete_revoked_credential_file(&mut self, revoked: &config::AllowedClient) {
+        let configured = revoked.issued_credential_file.trim();
+        if configured.is_empty() {
+            self.app.notify(
+                "凭据已撤销并立即生效；旧记录没有关联签发文件，客户端副本仍需手动删除".into(),
+            );
+            return;
+        }
+        let configured_path = Path::new(configured);
+        let path = if configured_path.is_absolute() {
+            configured_path.to_path_buf()
+        } else {
+            self.resolve_credential_output(configured)
+        };
+        match client::remove_issued_credential_bundle(&path, &revoked.static_public_key) {
+            Ok(true) => self.app.notify(format!(
+                "凭据已撤销并立即生效；已删除签发文件 {}",
+                path.display()
+            )),
+            Ok(false) => self
+                .app
+                .notify("凭据已撤销并立即生效；签发文件已被移动或删除，客户端副本现已失效".into()),
+            Err(error) => self
+                .app
+                .notify(format!("凭据已撤销并立即生效；签发文件未删除: {error}")),
         }
     }
 
@@ -581,7 +638,7 @@ impl ProductionApp {
             if let Some(client) = self
                 .client_acl
                 .iter()
-                .find(|client| client.client_id.eq_ignore_ascii_case(&view.label))
+                .find(|client| client.client_id == view.client_id)
             {
                 view.access = if !self.app.hosts.is_empty()
                     && client.allowed_hosts.len() == self.app.hosts.len()
@@ -596,7 +653,7 @@ impl ProductionApp {
         removed_permissions
     }
 
-    fn persist_server_with_notice(&mut self) {
+    fn persist_server_with_notice(&mut self) -> bool {
         match self.sync_server_from_view() {
             Ok(removed_permissions) => {
                 self.app.deployment_summary = format!("配置已保存  {}", self.config_path.display());
@@ -611,8 +668,12 @@ impl ProductionApp {
                 if self.app.screen == Screen::SaveExit {
                     self.build_deployment_info();
                 }
+                true
             }
-            Err(error) => self.app.notify(format!("保存失败: {error}")),
+            Err(error) => {
+                self.app.notify(format!("保存失败: {error}"));
+                false
+            }
         }
     }
 
@@ -688,6 +749,13 @@ impl ProductionApp {
             self.app.notify("请先用 Space 选择至少一台主机".into());
             return;
         }
+        if targets.len() > protocol::MAX_WAKE_TARGETS {
+            self.app.notify(format!(
+                "单次最多唤醒 {} 台主机，请减少选择",
+                protocol::MAX_WAKE_TARGETS
+            ));
+            return;
+        }
         if self.catalog_version == 0 {
             self.app.notify("主机目录尚未就绪，请稍候".into());
             return;
@@ -722,8 +790,8 @@ impl ProductionApp {
             ticket: None,
             receipt: false,
             finished: false,
-            receipt_deadline: now + Duration::from_secs(15),
-            deadline: now + Duration::from_secs(60),
+            receipt_deadline: now + client::RECEIPT_TIMEOUT,
+            deadline: now + client::WAKE_WAIT_TIMEOUT,
         });
     }
 
@@ -745,7 +813,12 @@ impl ProductionApp {
             })
             .map(|(_, host)| host.id.clone())
             .collect::<Vec<_>>();
-        if let Err(error) = validate_credential_form(&label, &output, allowed_hosts.len()) {
+        let validation = if self.app.issue_edit_index.is_some() {
+            validate_credential_edit(allowed_hosts.len())
+        } else {
+            validate_credential_form(&label, &output, allowed_hosts.len())
+        };
+        if let Err(error) = validation {
             self.app.notify(error);
             return;
         }
@@ -809,7 +882,7 @@ impl ProductionApp {
         let bundle = client::CredentialBundle {
             version: 1,
             client_id: client_id.clone(),
-            device_label: label,
+            device_label: label.clone(),
             shared_secret: self.config.security.shared_secret.clone(),
             static_private_key,
             static_public_key: static_public_key.clone(),
@@ -826,12 +899,20 @@ impl ProductionApp {
             .allowed_clients
             .push(config::AllowedClient {
                 client_id: client_id.clone(),
+                display_label: label.clone(),
                 static_public_key,
                 allowed_hosts,
+                issued_credential_file: output_path.to_string_lossy().into_owned(),
             });
         if let Err(error) = candidate.save(&self.config_path) {
-            let _ = std::fs::remove_file(&output_path);
-            self.app.notify(format!("无法保存服务端 ACL: {error}"));
+            let rollback = std::fs::remove_file(&output_path);
+            self.app.notify(match rollback {
+                Ok(()) => format!("无法保存服务端 ACL，已撤回凭据文件: {error}"),
+                Err(cleanup_error) => format!(
+                    "无法保存服务端 ACL: {error}；凭据回滚也失败，请立即删除 {}: {cleanup_error}",
+                    output_path.display()
+                ),
+            });
             return;
         }
         self.config = candidate;
@@ -898,13 +979,13 @@ impl ProductionApp {
         let spawn_result = thread::Builder::new()
             .name("rop-server".into())
             .spawn(move || {
-                let _ = server::run_server_with_shutdown(
+                server::run_server_with_shutdown(
                     &path,
                     None,
                     None,
                     shutdown_for_thread,
                     metrics_for_thread,
-                );
+                )
             });
         let server_thread = match spawn_result {
             Ok(thread) => thread,
@@ -962,7 +1043,13 @@ impl ProductionApp {
             shutdown.store(true, Ordering::Release);
         }
         if let Some(thread) = self.server_thread.take() {
-            let _ = thread.join();
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => self.app.notify(format!("服务停止时返回错误: {error}")),
+                Err(_) => self
+                    .app
+                    .notify("服务线程发生 panic，详细信息已写入日志".into()),
+            }
         }
         self.server_started = false;
         self.app.server_phase = ServerPhase::Stopped;
@@ -1112,7 +1199,7 @@ impl ProductionApp {
                 operation_id,
                 attempt,
                 retry_ticket,
-                deadline_ms,
+                deadline_ms: _,
                 results,
             } => {
                 let Some(wake) = self.wake.as_mut() else {
@@ -1129,15 +1216,11 @@ impl ProductionApp {
                     .map(|result| result.host_id.clone())
                     .collect();
                 let now = Instant::now();
-                wake.deadline =
-                    now + Duration::from_millis(deadline_ms.saturating_sub(client::now_ms()));
+                wake.deadline = now + client::WAKE_WAIT_TIMEOUT;
                 self.app.wake_receipt = true;
                 self.app.wake_phase = WakePhase::Waiting;
                 self.app.wake_deadline = wake.deadline;
-                self.app.wake_started_at = wake
-                    .deadline
-                    .checked_sub(Duration::from_secs(60))
-                    .unwrap_or(now);
+                self.app.wake_started_at = now;
                 for result in results {
                     if result.accepted
                         && let Some(host) = self
@@ -1195,14 +1278,24 @@ impl ProductionApp {
             client::ClientEvent::Error(error) => self.app.notify(error),
             client::ClientEvent::Disconnected => {
                 self.client = None;
-                self.wake = None;
-                if matches!(self.app.screen, Screen::ClientHosts | Screen::Wake) {
+                let wake_in_progress = self.wake.as_ref().is_some_and(|wake| !wake.finished);
+                if !wake_in_progress
+                    && matches!(self.app.screen, Screen::ClientHosts | Screen::Wake)
+                {
                     self.app.screen = Screen::ClientConnect;
                 }
                 self.app.connection_phase = ClientConnectionPhase::Disconnected;
                 self.app.connection_display = "连接已断开".into();
+                self.app.connection_error_code = Some("TRANSPORT".into());
+                self.app.connection_error_message =
+                    Some("安全连接已断开，当前唤醒状态未完成".into());
                 self.app.connection_retry_at = None;
-                self.app.notify("客户端连接已断开".into());
+                if wake_in_progress {
+                    self.app
+                        .notify("客户端连接已断开，唤醒状态已保留；重新连接后将恢复回执".into());
+                } else {
+                    self.app.notify("客户端连接已断开".into());
+                }
             }
         }
     }
@@ -1258,8 +1351,8 @@ impl ProductionApp {
                 wake.attempt = 2;
                 wake.receipt = false;
                 wake.accepted.clear();
-                wake.receipt_deadline = now + Duration::from_secs(15);
-                wake.deadline = now + Duration::from_secs(60);
+                wake.receipt_deadline = now + client::RECEIPT_TIMEOUT;
+                wake.deadline = now + client::WAKE_WAIT_TIMEOUT;
                 self.app.wake_attempt = 2;
                 self.app.wake_receipt = false;
                 self.app.wake_phase = WakePhase::Retrying;
@@ -1308,7 +1401,7 @@ impl ProductionApp {
         let now = Instant::now();
         if let Some(wake) = self.wake.as_mut() {
             wake.receipt = false;
-            wake.receipt_deadline = now + Duration::from_secs(15);
+            wake.receipt_deadline = now + client::RECEIPT_TIMEOUT;
         }
         self.app.wake_receipt = false;
         self.app.wake_attempt = attempt;
@@ -1341,7 +1434,13 @@ impl ProductionApp {
             return;
         }
         if let Some(thread) = self.server_thread.take() {
-            let _ = thread.join();
+            match thread.join() {
+                Ok(Ok(())) => self.app.notify("服务线程已退出".into()),
+                Ok(Err(error)) => self.app.notify(format!("服务异常退出: {error}")),
+                Err(_) => self
+                    .app
+                    .notify("服务线程发生 panic，详细信息已写入日志".into()),
+            }
         }
         self.server_started = false;
         self.server_shutdown = None;
@@ -1352,8 +1451,14 @@ impl ProductionApp {
     }
 
     fn shutdown_client(&mut self) {
-        if let Some(handle) = self.client.take() {
-            let _ = handle.commands.send(client::ClientCommand::Shutdown);
+        if let Some(handle) = self.client.take()
+            && handle
+                .commands
+                .send(client::ClientCommand::Shutdown)
+                .is_err()
+            && !self.app.should_quit
+        {
+            self.app.notify("客户端连接任务已提前退出".into());
         }
         self.wake = None;
         self.app.connection_phase = ClientConnectionPhase::Disconnected;
@@ -1430,8 +1535,11 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
         let executable = std::env::current_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "./RemoteOpenPower".into());
+        let executable = shell_quote(&executable);
+        let config = shell_quote(&config);
         return vec![
             "Linux systemd 部署".into(),
+            "getent passwd remote-open-power >/dev/null || sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin remote-open-power".into(),
             format!(
                 "sudo install -Dm0755 {executable} /usr/local/bin/remote-open-power"
             ),
@@ -1439,6 +1547,7 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
             format!(
                 "sudo install -m0640 -o root -g remote-open-power {config} /etc/remote-open-power/remote-open-power.toml"
             ),
+            "sudo install -d -m0750 -o remote-open-power -g remote-open-power /var/log/remote-open-power".into(),
             "将下面内容保存为 /etc/systemd/system/remote-open-power.service".into(),
             "[Unit]".into(),
             "Description=RemoteOpenPower secure Wake-on-LAN daemon".into(),
@@ -1450,6 +1559,7 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
             "Group=remote-open-power".into(),
             "UMask=0077".into(),
             "LogsDirectory=remote-open-power".into(),
+            "LogsDirectoryMode=0750".into(),
             "Environment=REMOTE_OPEN_POWER_LOG_DIR=/var/log/remote-open-power".into(),
             "ExecStart=/usr/local/bin/remote-open-power --server --config=/etc/remote-open-power/remote-open-power.toml".into(),
             "Restart=on-failure".into(),
@@ -1467,7 +1577,7 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
             "WantedBy=multi-user.target".into(),
             "sudo systemctl daemon-reload".into(),
             "sudo systemctl enable --now remote-open-power".into(),
-            "前台验证: /usr/local/bin/remote-open-power --server --config /etc/remote-open-power/remote-open-power.toml".into(),
+            "前台排错: sudo systemctl stop remote-open-power && sudo -u remote-open-power env REMOTE_OPEN_POWER_LOG_DIR=/var/log/remote-open-power /usr/local/bin/remote-open-power --server --config /etc/remote-open-power/remote-open-power.toml".into(),
             "PSK 保存在配置文件，不放入 ExecStart。".into(),
             "运行日志位于 /var/log/remote-open-power。".into(),
         ];
@@ -1484,6 +1594,11 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
     {
         vec!["当前平台没有可用的部署模板。".into()]
     }
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
@@ -1548,6 +1663,7 @@ mod production_tests {
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         state.app.screen = Screen::Credentials;
         state.app.clients.push(ClientRow {
+            client_id: "portable-client".to_owned(),
             label: "portable-client".to_owned(),
             access: "全部主机".to_owned(),
         });
@@ -1567,9 +1683,78 @@ mod production_tests {
     }
 
     #[test]
+    fn revocation_saves_acl_and_deletes_the_server_side_credential_copy() {
+        let directory = std::env::temp_dir().join(format!(
+            "remote-open-power-revoke-issued-{}-{}",
+            std::process::id(),
+            client::now_ms()
+        ));
+        std::fs::create_dir_all(&directory).expect("create revoke test directory");
+        let config_path = directory.join("remote-open-power.toml");
+        let credential_path = directory.join("portable.credential.toml");
+        let mut state =
+            ProductionApp::new(&config_path, test_capabilities()).expect("production state");
+        state.app.hosts.push(HostRow {
+            id: "test_v6".to_owned(),
+            name: "IPv6 test".to_owned(),
+            mac: "02:11:22:33:44:55".to_owned(),
+            ip: "fe80::1234".to_owned(),
+            wol_ipv6_interface: 7,
+            state: HostState::Unknown,
+            selected: false,
+        });
+        state
+            .sync_server_from_view()
+            .expect("save host before issuing credential");
+        state.app.open_credential_issue(None);
+        state.app.issue_label_input = Input::new("portable".to_owned());
+        state.app.issue_output_input = Input::new(credential_path.to_string_lossy().into_owned());
+        state.app.issue_selected = vec![true];
+        state.issue_credential();
+        assert!(credential_path.is_file());
+        assert_eq!(state.client_acl.len(), 1);
+
+        state.app.screen = Screen::Credentials;
+        state.app.credential_index = 0;
+        state.app.modal = Some(Modal::RevokeCredential);
+        state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(!credential_path.exists());
+        assert!(state.client_acl.is_empty());
+        let saved = config::AppConfig::load(&config_path).expect("load revoked config");
+        assert!(saved.security.allowed_clients.is_empty());
+        std::fs::remove_file(&config_path).expect("remove revoke test config");
+        std::fs::remove_dir(&directory).expect("remove revoke test directory");
+    }
+
+    #[test]
+    fn text_editor_shows_cursor_and_non_editor_hides_it() {
+        let mut app = App::with_capabilities(test_capabilities());
+        app.screen = Screen::HostEditor;
+        app.editor_inputs[0] = Input::new("test_v6".to_owned());
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render editor");
+        assert!(terminal.backend().cursor_visible());
+        assert!(terminal.backend().cursor_position().x > 0);
+
+        app.screen = Screen::ServerHome;
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render non-editor");
+        assert!(!terminal.backend().cursor_visible());
+    }
+
+    #[test]
     fn stale_and_duplicate_host_permissions_are_removed_before_save() {
         let mut clients = vec![config::AllowedClient {
             client_id: "portable-client".to_owned(),
+            display_label: "Portable client".to_owned(),
             static_public_key: String::new(),
             allowed_hosts: vec![
                 "LAB-PC".to_owned(),
@@ -1577,6 +1762,7 @@ mod production_tests {
                 "removed-pc".to_owned(),
                 "  ".to_owned(),
             ],
+            issued_credential_file: String::new(),
         }];
         let valid = HashSet::from(["lab-pc".to_owned()]);
 
@@ -1606,12 +1792,15 @@ mod production_tests {
         });
         let client_identity = security::Identity::generate().expect("client identity");
         state.client_acl.push(config::AllowedClient {
-            client_id: "portable-client".to_owned(),
+            client_id: security::client_id_from_public_key(&client_identity.public),
+            display_label: "Portable client".to_owned(),
             static_public_key: format!("hex:{}", hex::encode(client_identity.public)),
             allowed_hosts: vec!["removed-pc".to_owned()],
+            issued_credential_file: String::new(),
         });
         state.app.clients.push(ClientRow {
-            label: "portable-client".to_owned(),
+            client_id: security::client_id_from_public_key(&client_identity.public),
+            label: "Portable client".to_owned(),
             access: "1 台主机".to_owned(),
         });
 
@@ -1955,16 +2144,16 @@ mod production_tests {
             "fd00::10".into(),
             "7".into(),
         ];
-        assert!(validate_host_form(&values).is_ok());
+        assert!(validate_host_form(&values, false).is_ok());
         values[3] = "fe80::1234".into();
-        assert!(validate_host_form(&values).is_ok());
+        assert!(validate_host_form(&values, false).is_ok());
         values[4] = "0".into();
-        assert!(validate_host_form(&values).is_err());
+        assert!(validate_host_form(&values, false).is_err());
         values[3] = "fd00::10".into();
         values[4] = "4294967296".into();
-        assert!(validate_host_form(&values).is_err());
+        assert!(validate_host_form(&values, false).is_err());
         values[4] = "adapter".into();
-        assert!(validate_host_form(&values).is_err());
+        assert!(validate_host_form(&values, false).is_err());
     }
 
     #[test]
