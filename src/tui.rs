@@ -2,7 +2,7 @@
 // a separate fake-data shell and is never included in the release binary.
 include!("tui_core.rs");
 
-use crate::{client, config, protocol, security, server};
+use crate::{client, config, logging, protocol, security, server};
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -39,8 +39,7 @@ struct ProductionApp {
     server_started: bool,
     server_shutdown: Option<Arc<AtomicBool>>,
     server_thread: Option<JoinHandle<Result<(), server::ServerError>>>,
-    server_log_rx: Option<Receiver<String>>,
-    server_log_guard: Option<server::LogSinkGuard>,
+    runtime_log_rx: Option<Receiver<String>>,
     server_metrics: server::ServerMetrics,
 }
 
@@ -57,6 +56,8 @@ pub fn run(config_path: &Path) -> Result<(), String> {
     }
 
     install_panic_hook();
+    let (log_sender, log_receiver) = mpsc::channel();
+    let _log_guard = logging::install_sink(log_sender);
     enable_raw_mode().map_err(|error| format!("无法启用终端模式: {error}"))?;
     let _guard = TerminalGuard;
     let mut output = stdout();
@@ -75,6 +76,7 @@ pub fn run(config_path: &Path) -> Result<(), String> {
         .map_err(|error| format!("无法清理终端: {error}"))?;
 
     let mut state = ProductionApp::new(config_path, capabilities)?;
+    state.runtime_log_rx = Some(log_receiver);
     while !state.app.should_quit {
         state.tick();
         terminal
@@ -132,8 +134,7 @@ impl ProductionApp {
             server_started: false,
             server_shutdown: None,
             server_thread: None,
-            server_log_rx: None,
-            server_log_guard: None,
+            runtime_log_rx: None,
             server_metrics: server::ServerMetrics::default(),
         };
         state.load_view_from_config();
@@ -968,9 +969,6 @@ impl ProductionApp {
             self.app.notify(format!("启动前保存失败: {error}"));
             return;
         }
-        self.server_log_guard.take();
-        let (sender, receiver) = mpsc::channel();
-        let guard = server::install_log_sink(sender);
         let path = self.config_path.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_for_thread = Arc::clone(&shutdown);
@@ -991,14 +989,11 @@ impl ProductionApp {
             Ok(thread) => thread,
             Err(error) => {
                 self.app.notify(format!("无法启动服务线程: {error}"));
-                drop(guard);
                 return;
             }
         };
         self.server_shutdown = Some(shutdown);
         self.server_thread = Some(server_thread);
-        self.server_log_rx = Some(receiver);
-        self.server_log_guard = Some(guard);
         self.server_metrics = metrics;
         self.server_started = true;
         self.app.started_at = Instant::now();
@@ -1063,8 +1058,8 @@ impl ProductionApp {
         self.app.deployment_lines = deployment_lines(&self.config_path);
     }
 
-    fn drain_server_logs(&mut self) {
-        let Some(receiver) = self.server_log_rx.as_ref() else {
+    fn drain_runtime_logs(&mut self) {
+        let Some(receiver) = self.runtime_log_rx.as_ref() else {
             return;
         };
         let mut messages = Vec::new();
@@ -1416,7 +1411,7 @@ impl ProductionApp {
     fn tick(&mut self) {
         self.app.active_connections = self.server_metrics.active_connections();
         self.app.tick();
-        self.drain_server_logs();
+        self.drain_runtime_logs();
         self.refresh_server_state();
         self.drain_client_events();
         self.tick_wake();
@@ -1472,7 +1467,6 @@ impl ProductionApp {
     fn shutdown(&mut self) {
         self.shutdown_client();
         self.stop_server();
-        self.server_log_guard = None;
     }
 }
 

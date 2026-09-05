@@ -37,7 +37,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::Sender,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -75,20 +74,6 @@ const ACCESS_POLICY_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 static LAST_REJECT_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_ACCEPT_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static SUPPRESSED_ACCEPT_LOGS: AtomicUsize = AtomicUsize::new(0);
-/// Installs a process-local sink for a foreground TUI.  The daemon keeps its
-/// normal stdout logging; the sink only receives the already sanitized line.
-/// There is deliberately one sink because the application owns one server
-/// runtime per process.
-pub struct LogSinkGuard {
-    _inner: logging::SinkGuard,
-}
-
-pub fn install_log_sink(sender: Sender<String>) -> LogSinkGuard {
-    LogSinkGuard {
-        _inner: logging::install_sink(sender),
-    }
-}
-
 fn log_event(level: &str, message: impl AsRef<str>) {
     let level = match level {
         "INFO" => Level::Info,

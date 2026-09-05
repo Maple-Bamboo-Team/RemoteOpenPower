@@ -1129,17 +1129,16 @@ fn send_client_event(
 ) -> bool {
     match events.try_send(event) {
         Ok(()) => true,
-        Err(error) => {
-            let reason = match error {
-                std::sync::mpsc::TrySendError::Full(_) => "queue full",
-                std::sync::mpsc::TrySendError::Disconnected(_) => "receiver disconnected",
-            };
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
             crate::logging::log(
                 crate::logging::Level::Warn,
-                format!("client event not delivered context={context} reason={reason}"),
+                format!("client event not delivered context={context} reason=queue full"),
             );
             false
         }
+        // Dropping ClientHandle is the consumer's explicit shutdown signal.
+        // The actor already treats this as a terminal state, not an error.
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
     }
 }
 
