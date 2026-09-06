@@ -1,23 +1,28 @@
 use chrono::Local;
 use std::{
     backtrace::Backtrace,
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     panic,
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock, TryLockError,
-        atomic::{AtomicU64, Ordering},
-        mpsc::Sender,
+        Arc, Mutex, OnceLock, TryLockError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 const MAX_LOG_LINE_CHARS: usize = 4_096;
 const LOG_DIRECTORY_ENV: &str = "REMOTE_OPEN_POWER_LOG_DIR";
+const MAX_TERMINAL_LOGS: usize = 2_048;
+static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EMERGENCY: OnceLock<Mutex<LogQueue>> = OnceLock::new();
 
 static STATE: OnceLock<Mutex<LoggerState>> = OnceLock::new();
 static NEXT_GUARD_ID: AtomicU64 = AtomicU64::new(1);
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Level {
@@ -40,7 +45,7 @@ impl Level {
 
 #[derive(Default)]
 struct LoggerState {
-    sink: Option<(u64, Sender<String>)>,
+    sink: Option<(u64, Arc<Mutex<LogQueue>>)>,
     file: Option<FileTarget>,
 }
 
@@ -53,11 +58,65 @@ pub struct SinkGuard {
     id: u64,
 }
 
+#[derive(Default)]
+struct LogQueue {
+    lines: VecDeque<String>,
+    omitted: usize,
+}
+
+impl LogQueue {
+    fn push(&mut self, line: String) {
+        if self.lines.len() == MAX_TERMINAL_LOGS {
+            self.lines.pop_front();
+            self.omitted = self.omitted.saturating_add(1);
+        }
+        self.lines.push_back(line);
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.omitted != 0 {
+            lines.push(format!(
+                "WARN {} terminal log lines omitted; consult the service log",
+                self.omitted
+            ));
+            self.omitted = 0;
+        }
+        lines.extend(self.lines.drain(..));
+        lines
+    }
+}
+
+pub struct LogReceiver(Arc<Mutex<LogQueue>>);
+
+impl LogReceiver {
+    pub fn drain(&self) -> Vec<String> {
+        flush_emergency();
+        recover_lock(&self.0).drain()
+    }
+}
+
+fn recover_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 impl Drop for SinkGuard {
     fn drop(&mut self) {
-        let mut state = lock_state();
-        if state.sink.as_ref().is_some_and(|(id, _)| *id == self.id) {
-            state.sink = None;
+        flush_emergency();
+        let remaining = {
+            let mut state = lock_state();
+            if state.sink.as_ref().is_some_and(|(id, _)| *id == self.id) {
+                let (_, queue) = state.sink.take().expect("matching terminal sink");
+                TERMINAL_ACTIVE.store(false, Ordering::Release);
+                recover_lock(&queue).drain()
+            } else {
+                Vec::new()
+            }
+        };
+        for line in remaining {
+            if let Err(error) = write_line(&mut io::stdout(), &line) {
+                eprintln!("FATAL terminal log flush failed: {error}; original={line}");
+            }
         }
     }
 }
@@ -75,6 +134,7 @@ impl FileGuard {
 
 impl Drop for FileGuard {
     fn drop(&mut self) {
+        flush_emergency();
         let mut state = lock_state();
         if state
             .file
@@ -86,10 +146,12 @@ impl Drop for FileGuard {
     }
 }
 
-pub fn install_sink(sender: Sender<String>) -> SinkGuard {
+pub fn install_sink() -> (SinkGuard, LogReceiver) {
     let id = next_guard_id();
-    lock_state().sink = Some((id, sender));
-    SinkGuard { id }
+    let queue = Arc::new(Mutex::new(LogQueue::default()));
+    lock_state().sink = Some((id, Arc::clone(&queue)));
+    TERMINAL_ACTIVE.store(true, Ordering::Release);
+    (SinkGuard { id }, LogReceiver(queue))
 }
 
 pub fn install_file(directory: &Path) -> io::Result<FileGuard> {
@@ -155,8 +217,19 @@ pub fn directory_for_config(config_path: &Path) -> PathBuf {
 }
 
 pub fn log(level: Level, message: impl AsRef<str>) {
+    flush_emergency();
     for line in normalized_lines(message.as_ref()) {
         emit(level, &line);
+    }
+}
+
+fn flush_emergency() {
+    let lines = EMERGENCY
+        .get()
+        .map(|queue| recover_lock(queue).drain())
+        .unwrap_or_default();
+    for line in lines {
+        emit(Level::Fatal, &line);
     }
 }
 
@@ -197,7 +270,9 @@ pub fn install_panic_hook() {
             "thread={thread_name}\nlocation={location}\npayload={payload}\nbacktrace:\n{backtrace}"
         );
         try_report_from_panic("process panic", &details);
-        previous(info);
+        if !TERMINAL_ACTIVE.load(Ordering::Acquire) {
+            previous(info);
+        }
     }));
 }
 
@@ -216,19 +291,23 @@ fn emit(level: Level, message: &str) {
             state.file = None;
         }
         (
-            state.sink.as_ref().map(|(_, sender)| sender.clone()),
+            state.sink.as_ref().map(|(_, queue)| Arc::clone(queue)),
             file_error,
         )
     };
 
+    if let Some(queue) = sink {
+        let mut queue = recover_lock(&queue);
+        if let Some(error) = file_error {
+            queue.push(format!(
+                "FATAL log file disabled after write failure: {error}"
+            ));
+        }
+        queue.push(sink_line);
+        return;
+    }
     if let Some(error) = file_error {
         eprintln!("FATAL log file disabled after write failure: {error}");
-    }
-
-    if let Some(sender) = sink
-        && sender.send(sink_line).is_ok()
-    {
-        return;
     }
     let mut stdout = io::stdout();
     if let Err(error) = write_line(&mut stdout, &disk_line) {
@@ -247,43 +326,37 @@ fn try_report_from_panic(headline: &str, details: &str) {
     );
 
     let state = logger_state();
-    match state.try_lock() {
-        Ok(mut state) => {
-            for line in &lines {
-                let disk_line = format!("{timestamp} {:<5} {line}", Level::Fatal.as_str());
-                let file_error = state
-                    .file
-                    .as_mut()
-                    .and_then(|target| write_line(&mut target.file, &disk_line).err());
-                if let Some(error) = file_error {
-                    state.file = None;
-                    eprintln!("FATAL panic report file write failed: {error}");
-                }
-                if let Some((_, sender)) = state.sink.as_ref() {
-                    if sender.send(format!("FATAL {line}")).is_err() {
-                        eprintln!("{disk_line}");
-                    }
-                } else {
-                    eprintln!("{disk_line}");
-                }
-            }
-        }
-        Err(TryLockError::Poisoned(error)) => {
-            let mut state = error.into_inner();
-            for line in &lines {
-                let disk_line = format!("{timestamp} {:<5} {line}", Level::Fatal.as_str());
-                if let Some(target) = state.file.as_mut()
-                    && let Err(error) = write_line(&mut target.file, &disk_line)
-                {
-                    eprintln!("FATAL poisoned logger file write failed: {error}");
-                }
-                eprintln!("{disk_line}");
-            }
-        }
+    let mut state = match state.try_lock() {
+        Ok(state) => state,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
         Err(TryLockError::WouldBlock) => {
             for line in &lines {
-                eprintln!("{timestamp} {:<5} {line}", Level::Fatal.as_str());
+                recover_lock(EMERGENCY.get_or_init(|| Mutex::new(LogQueue::default())))
+                    .push(format!("panic report deferred: {line}"));
+                if !TERMINAL_ACTIVE.load(Ordering::Acquire) {
+                    eprintln!("{timestamp} FATAL {line}");
+                }
             }
+            return;
+        }
+    };
+    for line in &lines {
+        let disk_line = format!("{timestamp} FATAL {line}");
+        if let Some(target) = state.file.as_mut()
+            && let Err(error) = write_line(&mut target.file, &disk_line)
+        {
+            state.file = None;
+            let failure = format!("FATAL panic report file write failed: {error}");
+            if let Some((_, queue)) = &state.sink {
+                recover_lock(queue).push(failure);
+            } else {
+                eprintln!("{failure}");
+            }
+        }
+        if let Some((_, queue)) = &state.sink {
+            recover_lock(queue).push(format!("FATAL {line}"));
+        } else {
+            eprintln!("{disk_line}");
         }
     }
 }
@@ -347,6 +420,7 @@ mod tests {
 
     #[test]
     fn service_logs_use_timestamped_sequence_and_standard_levels() {
+        let _serial = TEST_SERIAL.lock().unwrap();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -390,5 +464,79 @@ mod tests {
         assert!(contents.contains("report cause=test"));
         assert!(contents.contains("report detail=full"));
         fs::remove_dir_all(directory).expect("remove log test directory");
+    }
+
+    #[test]
+    fn terminal_sink_retains_errors_and_deferred_panic_reports() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let directory = crate::test_support::TestDirectory::new();
+        let (_sink, receiver) = install_sink();
+        let file = install_file(&directory.0).unwrap();
+        {
+            let _locked = lock_state();
+            try_report_from_panic("worker panic", "bounded test report");
+        }
+        assert!(
+            receiver
+                .drain()
+                .iter()
+                .any(|line| line.contains("bounded test report"))
+        );
+        let saved = fs::read_to_string(file.path()).unwrap();
+        assert!(saved.contains("bounded test report"));
+        {
+            let mut state = lock_state();
+            state.file.as_mut().unwrap().file = File::open(file.path()).unwrap();
+        }
+        log(Level::Error, "terminal error marker");
+        let lines = receiver.drain();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("FATAL log file disabled"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("terminal error marker"))
+        );
+        assert!(lock_state().file.is_none());
+        drop(receiver);
+        log(Level::Warn, "receiver dropped marker");
+        let queue = lock_state().sink.as_ref().unwrap().1.clone();
+        assert!(
+            recover_lock(&queue)
+                .drain()
+                .iter()
+                .any(|line| line.contains("receiver dropped marker"))
+        );
+    }
+
+    #[test]
+    fn terminal_log_queue_is_bounded_and_reports_omissions() {
+        let mut queue = LogQueue::default();
+        for index in 0..MAX_TERMINAL_LOGS + 3 {
+            queue.push(index.to_string());
+        }
+        let lines = queue.drain();
+        assert_eq!(lines.len(), MAX_TERMINAL_LOGS + 1);
+        assert!(lines[0].contains("3 terminal log lines omitted"));
+        assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn daemon_panic_during_logging_is_persisted_after_unlock() {
+        let _serial = TEST_SERIAL.lock().unwrap();
+        let directory = crate::test_support::TestDirectory::new();
+        let guard = install_file(&directory.0).unwrap();
+        let path = guard.path().to_path_buf();
+        {
+            let _locked = lock_state();
+            try_report_from_panic("daemon panic marker", "report while logger locked");
+        }
+        drop(guard);
+        let text = fs::read_to_string(path).unwrap();
+        assert!(text.contains("daemon panic marker"));
+        assert!(text.contains("report while logger locked"));
     }
 }

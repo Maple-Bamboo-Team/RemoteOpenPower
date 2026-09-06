@@ -17,6 +17,51 @@
 
 本节是对下方原始发现的当前状态标注；下方问题描述保留用于审计追溯。
 
+## 全项目复审修复
+
+后续复审发现的 R1-R17 与上表 H1/M1-M5 分开跟踪，逐项状态见 [TASK.md](../TASK.md)。本轮不改变部署级共享 PSK（M4）或默认监听策略（M1），不能据此宣称所有安全风险已消除。
+
+- 配置解析错误在读取边界去掉原始输入，只保留文件与行列；FATAL 报告不再通过 TOML Debug 泄露密钥。
+- 监听作用域拥有全部连接与探测任务的取消、回收；日志队列拥有终端输出，后台 panic 不恢复主线程终端，文件故障不穿透 TUI。
+- 热加载发布完整的已验证配置版本，握手名单、ACL 和目标使用同一版本。目标变化使旧目录/会话失效；监听变化停止服务并要求重启。命令行监听覆盖跨刷新保留。
+- 保存采用候选配置，替换前失败保留原内存授权和视图。Linux 替换后目录同步失败会报告持久化不确定，但内存采用已写入版本，不能回滚成旧授权或删除已经获授权的凭据。
+- 操作记录有效时，恢复同一次唤醒仅取回执行回执并恢复观察，不再发包，也不重置客户端首回执起算的 60 秒。客户端从本次尝试开始最多自动恢复 13 分钟；编译期不变量保证恢复截止早于 15 分钟记录期限，并留出重试票据、连接和回执预算。服务重启后没有持久化恢复承诺。
+- CLI/TUI 以原始全部目标判断成功，部分拒绝不会显示绿色 OK。非交互失败退出 1，重定向不输出 ANSI 或未展开颜色占位符。
+- Windows 私密读取在文件句柄上检查所有者、DACL、重解析点和硬链接；只读句柄可并存。删除使用同一已验证句柄。Linux 保留最终符号链接检查，删除先隔离目录项再验证；恢复遇到名称冲突时不覆盖其他文件，并报告保留路径。
+- 多地址连接按候选回退，最多 16 个候选共享 5 秒 TCP 连接预算；系统 DNS 解析本身仍受操作系统解析器超时控制。
+- 删除 Linux 链接诊断整类屏蔽。仅 Zig 的 `ignoring deprecated linker optimization setting '1'` 是维护者批准的例外，不忽略其他警告。
+
+### 回归测试
+
+在仓库根目录按 README 设置 Cargo/rustup/TEMP/TMP/target，再依次执行，避免多个 Cargo 命令抢占同一构建目录：
+
+```text
+cargo fmt --all --check
+rustfmt --edition 2024 --check src/server_tests.rs src/tui_tests.rs src/tui_core.rs
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+全部测试已包含以下专项，无需另外下载测试脚本：
+
+| 内容 | 测试位置/名称 |
+|------|---------------|
+| 超长 host ID、保留 ID、目录不含 MAC/IP | `config::tests`、`protocol::tests` |
+| 握手额度与按客户端隔离冷却 | `server::tests` 中 `handshake`、`cooldown` 用例 |
+| 停止后的旧连接、热加载、新凭据和撤销 | `src/server_tests.rs` |
+| 恢复回执不重复发送 WoL、票据/墓碑期限 | `src/server_tests.rs`、`wake::tests` |
+| 完整 FATAL 脱敏与日志故障 | `malformed_secret_config_is_redacted_in_full_fatal_report`、`logging::tests` |
+| 文件权限、硬链接和身份绑定删除 | `config::tests`、`private_file::tests` |
+| 保存失败、数字导航、恢复计时和部分失败 | `tui::production_tests` |
+| CLI 实际命令渲染/退出边界的独立进程测试 | `cli_tests::wake_process_exit_status_and_redirected_output_match_outcome` |
+| Linux 文件分支 | 在 Windows 上交叉编译；执行需原生 Linux |
+
+例如只重跑服务端安全回归：`cargo test --locked server::tests`。完整测试中的 CLI 超时用例会实际等待约 15 秒，不是卡住。测试用 INFO/WARN/ERROR/FATAL 是故障注入输出，以最终测试结果为准。
+
+双平台发行版：Windows PowerShell 执行 `./scripts/build-both.ps1`，该脚本先 `cargo clean`，再串行构建 Windows/Linux，使用 G 盘 Zig。不要使用 WSL。
+
+Linux 原生复验时运行同一套格式、all-target 测试与 Clippy，并使用部署页生成的账户、目录和 unit 验证 systemd。Windows 交叉构建不证明 Linux 文件权限、原生终端错误恢复、systemd 或 Realtek 网卡 IPv6 WoL 行为；这些运行场景本轮未验证。
+
 ---
 
 ## 高危

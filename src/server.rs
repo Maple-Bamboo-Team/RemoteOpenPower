@@ -58,7 +58,15 @@ const REQUEST_SKEW: Duration = Duration::from_secs(60);
 const LEDGER_TTL: Duration = Duration::from_secs(15 * 60);
 const PENDING_LEDGER_TTL: Duration = Duration::from_secs(2 * 60);
 const RETRY_TTL: Duration = Duration::from_secs(90);
+const _: () = assert!(
+    crate::wake::RECOVERY_TIMEOUT.as_secs()
+        + RETRY_TTL.as_secs()
+        + crate::client::CONNECT_TIMEOUT.as_secs()
+        + crate::client::RECEIPT_TIMEOUT.as_secs()
+        < LEDGER_TTL.as_secs()
+);
 const MONITOR_TIMEOUT: Duration = Duration::from_secs(60);
+const _: () = assert!(MONITOR_TIMEOUT.as_secs() == crate::client::WAKE_WAIT_TIMEOUT.as_secs());
 const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const WAKE_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_LEDGER_ENTRIES: usize = 4_096;
@@ -156,7 +164,7 @@ fn operation_name(operation: &ClientOperation) -> &'static str {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
-    #[error("configuration error")]
+    #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
     #[error("security error")]
     Security(#[from] SecurityError),
@@ -168,7 +176,7 @@ pub enum ServerError {
     Invalid(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct HostEntry {
     id: String,
     config: HostConfig,
@@ -190,18 +198,13 @@ struct ClientAccess {
     allowed_hosts: HashSet<String>,
 }
 
+#[derive(Clone)]
 struct AccessPolicy {
+    config: AppConfig,
+    snapshot: Arc<Snapshot>,
+    handshake: Arc<ServerHandshakeConfig>,
     clients: HashMap<[u8; 32], ClientAccess>,
     source_healthy: bool,
-}
-
-impl AccessPolicy {
-    fn new(clients: HashMap<[u8; 32], ClientAccess>) -> Self {
-        Self {
-            clients,
-            source_healthy: true,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
@@ -528,17 +531,13 @@ impl Ledger {
             if entry.wake.as_ref().is_some_and(|wake| wake.attempt != 1) {
                 return WakeBeginResult::Replay;
             }
-            if entry
-                .wake
-                .as_ref()
-                .is_some_and(|wake| wake.ticket_expires <= now)
-            {
-                return WakeBeginResult::Replay;
+            if let Some(response) = renew_cached_wake(entry, now) {
+                if let Some(wake) = &entry.wake {
+                    self.tickets.insert(wake.ticket, key);
+                }
+                return WakeBeginResult::Cached(response);
             }
-            if let Some(response) = &entry.response {
-                return WakeBeginResult::Cached(response.clone());
-            }
-            return WakeBeginResult::Busy;
+            return WakeBeginResult::Replay;
         }
         if !self.has_capacity_for(&key.client_key) {
             return WakeBeginResult::Busy;
@@ -580,9 +579,6 @@ impl Ledger {
             now,
         } = retry;
         self.prune(now);
-        if self.tickets.get(&ticket) != Some(&key) {
-            return WakeBeginResult::Replay;
-        }
         let Some(entry) = self.entries.get_mut(&key) else {
             return WakeBeginResult::Replay;
         };
@@ -592,10 +588,16 @@ impl Ledger {
         if entry.pending {
             return WakeBeginResult::Busy;
         }
-        if let Some(response) = &entry.response
-            && entry.wake.as_ref().is_some_and(|wake| wake.attempt >= 2)
+        if entry
+            .wake
+            .as_ref()
+            .is_some_and(|wake| wake.attempt == 2 && wake.ticket == ticket)
         {
-            return WakeBeginResult::Cached(response.clone());
+            return renew_cached_wake(entry, now)
+                .map_or(WakeBeginResult::Replay, WakeBeginResult::Cached);
+        }
+        if self.tickets.get(&ticket) != Some(&key) {
+            return WakeBeginResult::Replay;
         }
         let Some(wake) = entry.wake.as_mut() else {
             return WakeBeginResult::Replay;
@@ -636,7 +638,21 @@ impl Ledger {
     }
 }
 
-#[derive(Clone)]
+fn renew_cached_wake(entry: &mut LedgerEntry, now: Instant) -> Option<ServerEnvelope> {
+    // Recovery extends observations and the retry lease, never dispatch and never the replay tombstone.
+    if entry.expires < now + RETRY_TTL {
+        return None;
+    }
+    let wake = entry.wake.as_mut()?;
+    let mut response = entry.response.clone()?;
+    let ServerEvent::CommandExecuted { deadline_ms, .. } = &mut response.event else {
+        return Some(response);
+    };
+    wake.ticket_expires = now + RETRY_TTL;
+    *deadline_ms = unix_ms().saturating_add(MONITOR_TIMEOUT.as_millis() as u64);
+    Some(response)
+}
+
 struct Monitor {
     operation_id: [u8; 16],
     attempt: u8,
@@ -644,6 +660,78 @@ struct Monitor {
     online: HashSet<String>,
     next_probe: Instant,
     deadline: Instant,
+    probe: Option<ProbeTask>,
+}
+
+struct ProbeTask {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<Vec<HostStatus>>>,
+}
+
+impl ProbeTask {
+    fn poll(&mut self) -> Result<Option<Vec<HostStatus>>, ServerError> {
+        if !self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            return Ok(None);
+        }
+        self.worker
+            .take()
+            .expect("finished probe worker")
+            .join()
+            .map(Some)
+            .map_err(|_| ServerError::Invalid("probe worker panicked".into()))
+    }
+}
+
+impl Drop for ProbeTask {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log_event("FATAL", "probe worker panicked while being stopped");
+        }
+    }
+}
+
+struct StatusJob {
+    request_id: [u8; 16],
+    hosts: Vec<String>,
+    probe: ProbeTask,
+}
+
+struct ConnectionWorkers {
+    stopping: Arc<AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ConnectionWorkers {
+    fn finish(&mut self) -> Result<(), ServerError> {
+        self.stopping.store(true, Ordering::Release);
+        let mut failed = false;
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                log_event("FATAL", "connection worker panicked while being stopped");
+                failed = true;
+            }
+        }
+        if failed {
+            Err(ServerError::Invalid("connection worker panicked".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ConnectionWorkers {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            log_event("FATAL", error.to_string());
+        }
+    }
 }
 
 type WakeCooldowns = HashMap<[u8; 32], HashMap<String, Instant>>;
@@ -685,6 +773,9 @@ pub struct ServerRuntime {
     access_policy: Arc<Mutex<AccessPolicy>>,
     access_policy_source: Option<Arc<PathBuf>>,
     metrics: ServerMetrics,
+    stopping: Arc<AtomicBool>,
+    bind_override: Option<String>,
+    port_override: Option<u16>,
 }
 
 impl ServerRuntime {
@@ -842,20 +933,29 @@ impl ServerRuntime {
             summaries.push(summary);
         }
         summaries.sort_by(|left, right| left.host_id.cmp(&right.host_id));
-        let catalog_version = catalog_version(&summaries);
+        let catalog_version = catalog_version(&config.hosts)?;
 
+        let snapshot = Arc::new(Snapshot {
+            bind_addrs,
+            dual_stack: config.server.dual_stack,
+            headers,
+            hosts,
+            summaries,
+            catalog_version,
+            max_requests_per_minute: config.security.max_requests_per_minute,
+            clock_skew: Duration::from_secs(config.security.clock_skew_seconds.min(60)),
+        });
+        let handshake = Arc::new(handshake);
+        let access_policy = AccessPolicy {
+            config,
+            snapshot: Arc::clone(&snapshot),
+            handshake: Arc::clone(&handshake),
+            clients: access_clients,
+            source_healthy: true,
+        };
         Ok(Self {
-            snapshot: Arc::new(Snapshot {
-                bind_addrs,
-                dual_stack: config.server.dual_stack,
-                headers,
-                hosts,
-                summaries,
-                catalog_version,
-                max_requests_per_minute: config.security.max_requests_per_minute,
-                clock_skew: Duration::from_secs(config.security.clock_skew_seconds.min(60)),
-            }),
-            handshake: Arc::new(handshake),
+            snapshot,
+            handshake,
             replay_cache: ReplayCache::default(),
             wake_sender,
             probe,
@@ -874,9 +974,12 @@ impl ServerRuntime {
             request_rates: Arc::new(RateLimiter::new()),
             ledger: Arc::new(Mutex::new(Ledger::new())),
             last_wake: Arc::new(Mutex::new(HashMap::new())),
-            access_policy: Arc::new(Mutex::new(AccessPolicy::new(access_clients))),
+            access_policy: Arc::new(Mutex::new(access_policy)),
             access_policy_source: None,
             metrics,
+            stopping: Arc::new(AtomicBool::new(false)),
+            bind_override: None,
+            port_override: None,
         })
     }
 
@@ -903,19 +1006,16 @@ impl ServerRuntime {
         let loaded = self.load_access_policy(path);
         let mut policy = lock(&self.access_policy);
         match loaded {
-            Ok(clients) => {
-                let changed = !policy.source_healthy || policy.clients != clients;
-                policy.clients = clients;
-                policy.source_healthy = true;
+            Ok(Some(updated)) => {
+                *policy = updated;
                 let client_count = policy.clients.len();
                 drop(policy);
-                if changed {
-                    log_event(
-                        "INFO",
-                        format!("access policy reloaded clients={client_count}"),
-                    );
-                }
+                log_event(
+                    "INFO",
+                    format!("runtime configuration reloaded clients={client_count}"),
+                );
             }
+            Ok(None) => {}
             Err(error) => {
                 let first_failure = policy.source_healthy;
                 policy.clients.clear();
@@ -931,44 +1031,47 @@ impl ServerRuntime {
         }
     }
 
-    fn load_access_policy(
-        &self,
-        path: &Path,
-    ) -> Result<HashMap<[u8; 32], ClientAccess>, ServerError> {
-        let config = AppConfig::load(path)?;
-        if config.secret_key()? != self.handshake.psk
-            || !config.client.address.trim().is_empty()
-            || !config.client.client_id.trim().is_empty()
-            || !config.client.static_private_key.trim().is_empty()
-            || !config.client.static_public_key.trim().is_empty()
-            || !config.client.pinned_server_static_key.trim().is_empty()
+    fn load_access_policy(&self, path: &Path) -> Result<Option<AccessPolicy>, ServerError> {
+        let mut config = AppConfig::load(path)?;
+        apply_listener_overrides(
+            &mut config,
+            self.bind_override.as_deref(),
+            self.port_override,
+        );
         {
-            return Err(ServerError::Invalid(
-                "runtime access policy no longer matches the server trust root".to_owned(),
-            ));
+            let policy = lock(&self.access_policy);
+            if policy.source_healthy && policy.config == config {
+                return Ok(None);
+            }
         }
-        let server_key = crate::config::decode_key(&config.security.server_static_public_key)
-            .map_err(|_| ServerError::Invalid("server identity is missing".to_owned()))?;
-        if server_key != self.handshake.identity.public {
-            return Err(ServerError::Invalid(
-                "runtime access policy no longer matches the server identity".to_owned(),
-            ));
+        let handshake = configured_handshake(&config)?;
+        let candidate = Self::new_with_components(
+            config,
+            handshake,
+            Arc::clone(&self.wake_sender),
+            Arc::clone(&self.probe),
+        )?;
+        Ok(Some(lock(&candidate.access_policy).clone()))
+    }
+
+    fn adopt_access_policy(&mut self) -> bool {
+        let policy = lock(&self.access_policy);
+        if !policy.source_healthy {
+            return false;
         }
-        let headers = config
-            .security
-            .custom_headers
-            .iter()
-            .map(|(name, value)| Header {
-                name: name.clone(),
-                value: value.clone(),
-            })
-            .collect::<Vec<_>>();
-        if canonical_headers(headers)? != self.snapshot.headers {
-            return Err(ServerError::Invalid(
-                "runtime access policy no longer matches the protocol headers".to_owned(),
-            ));
-        }
-        client_access_from_config(&config)
+        self.snapshot = Arc::clone(&policy.snapshot);
+        self.handshake = Arc::clone(&policy.handshake);
+        true
+    }
+
+    fn session_policy_current(&self) -> bool {
+        let policy = lock(&self.access_policy);
+        policy.source_healthy
+            && self.snapshot.hosts == policy.snapshot.hosts
+            && self.snapshot.headers == policy.snapshot.headers
+            && self.snapshot.clock_skew == policy.snapshot.clock_skew
+            && self.handshake.psk == policy.handshake.psk
+            && self.handshake.identity.public == policy.handshake.identity.public
     }
 
     /// Bind and serve forever.  Each accepted connection owns one bounded
@@ -1018,96 +1121,129 @@ impl ServerRuntime {
         }
         self.metrics.set_listening(true);
         let _listening_guard = ListeningGuard(self.metrics.clone());
-        let mut next_access_policy_refresh = Instant::now();
-        loop {
-            if shutdown.load(Ordering::Acquire) {
-                log_event("INFO", "listener stopped by operator");
-                return Ok(());
-            }
-            let now = Instant::now();
-            if now >= next_access_policy_refresh {
-                self.refresh_access_policy();
-                next_access_policy_refresh = now + ACCESS_POLICY_REFRESH_INTERVAL;
-            }
-            let mut accepted = None;
-            for listener in &listeners {
-                match listener.accept() {
-                    Ok(value) => {
-                        accepted = Some(value);
-                        break;
+        let mut workers = ConnectionWorkers {
+            stopping: Arc::clone(&shutdown),
+            workers: Vec::new(),
+        };
+        let result = (|| {
+            let mut next_access_policy_refresh = Instant::now();
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    log_event("INFO", "listener stopped by operator");
+                    return Ok(());
+                }
+                let now = Instant::now();
+                if now >= next_access_policy_refresh {
+                    self.refresh_access_policy();
+                    if lock(&self.access_policy).snapshot.bind_addrs != self.snapshot.bind_addrs {
+                        return Err(ServerError::Invalid(
+                            "listener configuration changed; restart required".into(),
+                        ));
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) if is_transient_accept_error(&error) => {
-                        log_rejection(format!("transient accept failure kind={:?}", error.kind()));
-                    }
-                    Err(error) => {
-                        log_event("ERROR", format!("accept failed kind={:?}", error.kind()));
-                        return Err(ServerError::Io(error));
+                    next_access_policy_refresh = now + ACCESS_POLICY_REFRESH_INTERVAL;
+                }
+                let mut index = 0;
+                while index < workers.workers.len() {
+                    if workers.workers[index].is_finished() {
+                        workers.workers.swap_remove(index).join().map_err(|_| {
+                            ServerError::Invalid("connection worker panicked".into())
+                        })?;
+                    } else {
+                        index += 1;
                     }
                 }
+                let mut accepted = None;
+                for listener in &listeners {
+                    match listener.accept() {
+                        Ok(value) => {
+                            accepted = Some(value);
+                            break;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(error) if is_transient_accept_error(&error) => {
+                            log_rejection(format!(
+                                "transient accept failure kind={:?}",
+                                error.kind()
+                            ));
+                        }
+                        Err(error) => {
+                            log_event("ERROR", format!("accept failed kind={:?}", error.kind()));
+                            return Err(ServerError::Io(error));
+                        }
+                    }
+                }
+                let Some((stream, peer)) = accepted else {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let peer_ip = normalize_ip(peer.ip());
+                if !self.handshake_rates.allow(
+                    RateKey::HandshakeIp(peer_ip),
+                    HANDSHAKE_RATE_PER_MINUTE,
+                    Duration::from_secs(60),
+                ) {
+                    shutdown_stream(&stream, peer);
+                    log_rejection(format!("handshake rate limited peer={peer}"));
+                    continue;
+                }
+                let Some(permit) = self.connections.acquire() else {
+                    shutdown_stream(&stream, peer);
+                    log_rejection(format!("connection limit reached peer={peer}"));
+                    continue;
+                };
+                let Some(ip_permit) = self.ip_connections.acquire(peer_ip) else {
+                    shutdown_stream(&stream, peer);
+                    log_rejection(format!("active connection limit reached peer={peer}"));
+                    continue;
+                };
+                let Some(pending_handshake_permit) = self.pending_handshakes.acquire(peer_ip)
+                else {
+                    shutdown_stream(&stream, peer);
+                    log_rejection(format!("pending handshake limit reached peer={peer}"));
+                    continue;
+                };
+                let Some(handshake_permit) = self.handshakes.acquire() else {
+                    shutdown_stream(&stream, peer);
+                    log_rejection(format!("handshake concurrency limit reached peer={peer}"));
+                    continue;
+                };
+                log_accept(peer);
+                let mut runtime = self.clone();
+                runtime.stopping = Arc::clone(&shutdown);
+                if !runtime.adopt_access_policy() {
+                    continue;
+                }
+                let spawn = thread::Builder::new()
+                    .name("rop-connection".to_owned())
+                    .spawn(move || {
+                        let _permit = permit;
+                        let _ip_permit = ip_permit;
+                        runtime.handle_connection(
+                            stream,
+                            peer,
+                            handshake_permit,
+                            pending_handshake_permit,
+                        );
+                    });
+                // On a failed spawn the closure argument (including the stream and
+                // permit) is dropped by `spawn`; the listener remains available for
+                // subsequent peers.
+                match spawn {
+                    Ok(worker) => workers.workers.push(worker),
+                    Err(error) => log_event(
+                        "ERROR",
+                        format!("connection worker spawn failed peer={peer}: {error}"),
+                    ),
+                }
             }
-            let Some((stream, peer)) = accepted else {
-                thread::sleep(Duration::from_millis(20));
-                continue;
-            };
-            let peer_ip = normalize_ip(peer.ip());
-            if !self.handshake_rates.allow(
-                RateKey::HandshakeIp(peer_ip),
-                HANDSHAKE_RATE_PER_MINUTE,
-                Duration::from_secs(60),
-            ) {
-                shutdown_stream(&stream, peer);
-                log_rejection(format!("handshake rate limited peer={peer}"));
-                continue;
-            }
-            let Some(permit) = self.connections.acquire() else {
-                shutdown_stream(&stream, peer);
-                log_rejection(format!("connection limit reached peer={peer}"));
-                continue;
-            };
-            let Some(ip_permit) = self.ip_connections.acquire(peer_ip) else {
-                shutdown_stream(&stream, peer);
-                log_rejection(format!("active connection limit reached peer={peer}"));
-                continue;
-            };
-            let Some(pending_handshake_permit) = self.pending_handshakes.acquire(peer_ip) else {
-                shutdown_stream(&stream, peer);
-                log_rejection(format!("pending handshake limit reached peer={peer}"));
-                continue;
-            };
-            let Some(handshake_permit) = self.handshakes.acquire() else {
-                shutdown_stream(&stream, peer);
-                log_rejection(format!("handshake concurrency limit reached peer={peer}"));
-                continue;
-            };
-            log_accept(peer);
-            let runtime = self.clone();
-            let spawn = thread::Builder::new()
-                .name("rop-connection".to_owned())
-                .spawn(move || {
-                    let _permit = permit;
-                    let _ip_permit = ip_permit;
-                    runtime.handle_connection(
-                        stream,
-                        peer,
-                        handshake_permit,
-                        pending_handshake_permit,
-                    );
-                });
-            // On a failed spawn the closure argument (including the stream and
-            // permit) is dropped by `spawn`; the listener remains available for
-            // subsequent peers.
-            if spawn.is_err() {
-                log_event(
-                    "ERROR",
-                    format!("connection worker spawn failed peer={peer}"),
-                );
-            }
-        }
+        })();
+        shutdown.store(true, Ordering::Release);
+        drop(listeners);
+        result.and(workers.finish())
     }
 
     fn handle_connection(
-        &self,
+        mut self,
         stream: TcpStream,
         peer: SocketAddr,
         handshake_permit: ConnectionPermit,
@@ -1153,7 +1289,14 @@ impl ServerRuntime {
         let mut key_confirmed = false;
         let mut partial_frame_started: Option<Instant> = None;
         let mut monitors = Vec::new();
+        let mut status_jobs = Vec::new();
         loop {
+            if self.stopping.load(Ordering::Acquire) || !self.session_policy_current() {
+                break;
+            }
+            if !self.adopt_access_policy() {
+                break;
+            }
             if (!key_confirmed && started.elapsed() >= KEY_CONFIRM_TIMEOUT)
                 || started.elapsed() >= MAX_SESSION_LIFETIME
                 || last_activity.elapsed() >= OPERATION_IDLE_TIMEOUT
@@ -1169,6 +1312,12 @@ impl ServerRuntime {
                         short_key(&client_key)
                     ),
                 );
+                break;
+            }
+            if let Err(error) =
+                self.service_status_jobs(&mut connection, client_key, &mut status_jobs)
+            {
+                log_event("ERROR", format!("status task failed peer={peer}: {error}"));
                 break;
             }
             if !self.service_monitors(&mut connection, client_key, &mut monitors) {
@@ -1267,7 +1416,14 @@ impl ServerRuntime {
                         break;
                     }
                     if matches!(&envelope.operation, ClientOperation::Wake { .. })
-                        && monitors.len() >= MAX_MONITORS_PER_CONNECTION
+                        && monitors
+                            .iter()
+                            .filter(|monitor| {
+                                monitor.deadline > Instant::now()
+                                    && monitor.operation_id != envelope.request_id
+                            })
+                            .count()
+                            >= MAX_MONITORS_PER_CONNECTION
                     {
                         log_rejection(format!(
                             "monitor limit reached peer={peer} client={} request={}",
@@ -1316,16 +1472,11 @@ impl ServerRuntime {
                         client_key,
                         &allowed_hosts,
                         envelope,
+                        &mut status_jobs,
                     ) {
                         Ok(Some(monitor)) => {
-                            // A retry supersedes the first attempt.  Keep
-                            // only the newest monitor so a delayed probe from
-                            // attempt 1 cannot produce a stale TargetOnline
-                            // event after attempt 2 has been accepted.
-                            monitors.retain(|old| {
-                                old.operation_id != monitor.operation_id
-                                    || old.attempt >= monitor.attempt
-                            });
+                            // Retire old probes without blocking the connection on their join.
+                            retire_monitors(&mut monitors, monitor.operation_id, monitor.attempt);
                             monitors.push(monitor);
                             log_event(
                                 "INFO",
@@ -1345,9 +1496,7 @@ impl ServerRuntime {
                             // only an accepted/previously accepted retry may
                             // cancel an older attempt.
                             if is_wake_retry && self.wake_attempt(operation_key) == Some(2) {
-                                monitors.retain(|old| {
-                                    old.operation_id != request_id || old.attempt >= 2
-                                });
+                                retire_monitors(&mut monitors, request_id, 2);
                             }
                         }
                         Err(_) => {
@@ -1396,6 +1545,7 @@ impl ServerRuntime {
         client_key: [u8; 32],
         allowed_hosts: &HashSet<String>,
         envelope: ClientEnvelope,
+        status_jobs: &mut Vec<StatusJob>,
     ) -> Result<Option<Monitor>, ServerError> {
         // Custom headers are part of the deployment policy, not merely
         // caller-supplied metadata.  Noise authenticates the transport, but
@@ -1431,7 +1581,21 @@ impl ServerRuntime {
                     ledger.begin_request(key, digest, Instant::now())
                 };
                 match begin {
-                    BeginResult::Cached(response) => {
+                    BeginResult::Cached(mut response) => {
+                        if let ServerEvent::Hosts {
+                            catalog_version,
+                            hosts,
+                        } = &mut response.event
+                        {
+                            *catalog_version = self.snapshot.catalog_version;
+                            *hosts = self
+                                .snapshot
+                                .summaries
+                                .iter()
+                                .filter(|host| allowed_hosts.contains(&host.host_id))
+                                .cloned()
+                                .collect();
+                        }
                         self.send_response(connection, response)?;
                     }
                     BeginResult::Busy => {
@@ -1511,36 +1675,32 @@ impl ServerRuntime {
                         self.send_error(connection, envelope.request_id, ErrorCode::Replay, false)?
                     }
                     BeginResult::New => {
-                        let statuses = hosts
-                            .iter()
-                            .map(|entry| HostStatus {
-                                host_id: entry.id.clone(),
-                                state: match self.probe_online(&entry.config) {
-                                    Some(true) => HostState::Online,
-                                    Some(false) => HostState::Offline,
-                                    None => HostState::Unknown,
-                                },
-                                observed_at_ms: unix_ms(),
-                            })
-                            .collect::<Vec<_>>();
-                        log_event(
-                            "INFO",
-                            format!(
-                                "status client={} request={} hosts={}",
-                                short_key(&client_key),
-                                short_request(&envelope.request_id),
-                                statuses.len()
-                            ),
-                        );
-                        let response = self.make_response(
-                            envelope.request_id,
-                            ServerEvent::Statuses {
-                                catalog_version: self.snapshot.catalog_version,
-                                statuses,
-                            },
-                        )?;
-                        self.complete_request(key, response.clone());
-                        self.send_response(connection, response)?;
+                        let task = if status_jobs.len() < 2 {
+                            self.spawn_probe(
+                                hosts
+                                    .iter()
+                                    .map(|entry| (entry.id.clone(), entry.config.clone()))
+                                    .collect(),
+                                client_key,
+                            )?
+                        } else {
+                            None
+                        };
+                        if let Some(probe) = task {
+                            status_jobs.push(StatusJob {
+                                request_id: envelope.request_id,
+                                hosts: host_ids,
+                                probe,
+                            });
+                        } else {
+                            lock(&self.ledger).entries.remove(&key);
+                            self.send_error(
+                                connection,
+                                envelope.request_id,
+                                ErrorCode::Busy,
+                                true,
+                            )?;
+                        }
                     }
                 }
                 Ok(None)
@@ -1672,6 +1832,19 @@ impl ServerRuntime {
                     ),
                 );
                 for entry in &hosts {
+                    let policy = lock(&self.access_policy);
+                    if self.stopping.load(Ordering::Acquire)
+                        || !policy.source_healthy
+                        || policy.snapshot.hosts.get(&entry.id) != Some(entry)
+                        || !policy
+                            .clients
+                            .get(&client_key)
+                            .is_some_and(|access| access.allowed_hosts.contains(&entry.id))
+                    {
+                        return Err(ServerError::Invalid(
+                            "wake cancelled by shutdown or policy change".into(),
+                        ));
+                    }
                     let result = match self.wake_sender.wake(&entry.config) {
                         Ok(()) => WakeResult {
                             host_id: entry.id.clone(),
@@ -1683,12 +1856,19 @@ impl ServerRuntime {
                             accepted: false,
                             error_code: Some(WakeErrorCode::InvalidTarget),
                         },
-                        Err(WakeError::Io(_)) => WakeResult {
-                            host_id: entry.id.clone(),
-                            accepted: false,
-                            error_code: Some(WakeErrorCode::SenderUnavailable),
-                        },
+                        Err(WakeError::Io(error)) => {
+                            log_event(
+                                "ERROR",
+                                format!("wake sender failed host={}: {error}", entry.id),
+                            );
+                            WakeResult {
+                                host_id: entry.id.clone(),
+                                accepted: false,
+                                error_code: Some(WakeErrorCode::SenderUnavailable),
+                            }
+                        }
                     };
+                    drop(policy);
                     results.push(result);
                 }
                 let accepted_count = results.iter().filter(|result| result.accepted).count();
@@ -1731,6 +1911,7 @@ impl ServerRuntime {
                     online: HashSet::new(),
                     next_probe: Instant::now(),
                     deadline: Instant::now() + MONITOR_TIMEOUT,
+                    probe: None,
                 }))
             }
         }
@@ -1856,32 +2037,60 @@ impl ServerRuntime {
             }) != Some(monitor.attempt)
             {
                 monitor.deadline = now;
-                continue;
             }
-            if now < monitor.next_probe {
-                continue;
+            if now >= monitor.deadline
+                && let Some(probe) = &monitor.probe
+            {
+                probe.cancelled.store(true, Ordering::Release);
             }
-            monitor.next_probe = now + MONITOR_INTERVAL;
-            for (host_id, host) in &monitor.targets {
-                if monitor.online.contains(host_id) {
-                    continue;
+            if let Some(probe) = monitor.probe.as_mut() {
+                match probe.poll() {
+                    Ok(Some(statuses)) => {
+                        monitor.probe = None;
+                        for status in statuses {
+                            if status.state == HostState::Online
+                                && Instant::now() < monitor.deadline
+                            {
+                                monitor.online.insert(status.host_id.clone());
+                                events.push((
+                                    monitor.operation_id,
+                                    monitor.attempt,
+                                    status.host_id,
+                                    monitor.deadline,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log_event("ERROR", format!("monitor probe failed: {error}"));
+                        return false;
+                    }
                 }
-                if Instant::now() >= monitor.deadline {
-                    break;
+            }
+            if monitor.probe.is_none() && now >= monitor.next_probe && now < monitor.deadline {
+                let targets = monitor
+                    .targets
+                    .iter()
+                    .filter(|(id, _)| !monitor.online.contains(id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !targets.is_empty() {
+                    match self.spawn_probe(targets, client_key) {
+                        Ok(task) => monitor.probe = task,
+                        Err(error) => {
+                            log_event("ERROR", format!("monitor probe start failed: {error}"));
+                            return false;
+                        }
+                    }
                 }
-                if self.probe_online(host) == Some(true) && Instant::now() < monitor.deadline {
-                    monitor.online.insert(host_id.clone());
-                    events.push((
-                        monitor.operation_id,
-                        monitor.attempt,
-                        host_id.clone(),
-                        monitor.deadline,
-                    ));
-                }
+                monitor.next_probe = now + MONITOR_INTERVAL;
             }
         }
         monitors.retain(|monitor| {
-            Instant::now() < monitor.deadline && monitor.online.len() < monitor.targets.len()
+            monitor.probe.is_some()
+                || (Instant::now() < monitor.deadline
+                    && monitor.online.len() < monitor.targets.len())
         });
         for (operation_id, attempt, host_id, deadline) in events {
             if !self.client_is_authorized(&client_key) {
@@ -1925,9 +2134,84 @@ impl ServerRuntime {
         true
     }
 
-    fn probe_online(&self, host: &HostConfig) -> Option<bool> {
-        let _permit = self.probe_slots.acquire()?;
-        Some(self.probe.is_online(host))
+    fn spawn_probe(
+        &self,
+        hosts: Vec<(String, HostConfig)>,
+        client_key: [u8; 32],
+    ) -> Result<Option<ProbeTask>, ServerError> {
+        let Some(permit) = self.probe_slots.acquire() else {
+            return Ok(None);
+        };
+        let runtime = self.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&cancelled);
+        let worker = thread::Builder::new()
+            .name("rop-probe".into())
+            .spawn(move || {
+                let _permit = permit;
+                let mut statuses = Vec::with_capacity(hosts.len());
+                for (id, host) in hosts {
+                    if cancel.load(Ordering::Acquire)
+                        || runtime.stopping.load(Ordering::Acquire)
+                        || !runtime.session_policy_current()
+                        || !runtime.client_is_authorized(&client_key)
+                    {
+                        break;
+                    }
+                    statuses.push(HostStatus {
+                        host_id: id,
+                        state: if runtime.probe.is_online(&host) {
+                            HostState::Online
+                        } else {
+                            HostState::Offline
+                        },
+                        observed_at_ms: unix_ms(),
+                    });
+                }
+                statuses
+            })?;
+        Ok(Some(ProbeTask {
+            cancelled,
+            worker: Some(worker),
+        }))
+    }
+
+    fn service_status_jobs(
+        &self,
+        connection: &mut SecureConnection,
+        client_key: [u8; 32],
+        jobs: &mut Vec<StatusJob>,
+    ) -> Result<(), ServerError> {
+        let mut index = 0;
+        while index < jobs.len() {
+            let Some(statuses) = jobs[index].probe.poll()? else {
+                index += 1;
+                continue;
+            };
+            let job = jobs.swap_remove(index);
+            let allowed = self.current_allowed_hosts(&client_key).unwrap_or_default();
+            if !job.hosts.iter().all(|id| allowed.contains(id)) || statuses.len() != job.hosts.len()
+            {
+                self.send_error(connection, job.request_id, ErrorCode::Unauthorized, false)?;
+                continue;
+            }
+            let response = self.make_response(
+                job.request_id,
+                ServerEvent::Statuses {
+                    catalog_version: self.snapshot.catalog_version,
+                    statuses,
+                },
+            )?;
+            self.complete_request(
+                OperationKey {
+                    client_key,
+                    operation_id: job.request_id,
+                },
+                response.clone(),
+            );
+            self.send_response(connection, response)?;
+        }
+        Ok(())
     }
 }
 
@@ -1967,6 +2251,7 @@ fn cached_monitor(response: &ServerEnvelope, hosts: &[HostEntry]) -> Option<Moni
         next_probe: Instant::now(),
         deadline: Instant::now()
             + Duration::from_millis(remaining_ms.min(MONITOR_TIMEOUT.as_millis() as u64)),
+        probe: None,
     })
 }
 
@@ -2087,75 +2372,69 @@ pub fn run_server(
     })
 }
 
-fn run_server_inner(
-    config_path: &Path,
-    bind_override: Option<String>,
-    port_override: Option<u16>,
-) -> Result<(), ServerError> {
-    let config_path = resolve_server_config_path(config_path)?;
-    let mut config = AppConfig::load(&config_path)?;
-    if !config.client.address.trim().is_empty()
-        || !config.client.client_id.trim().is_empty()
-        || !config.client.static_private_key.trim().is_empty()
-        || !config.client.static_public_key.trim().is_empty()
-        || !config.client.pinned_server_static_key.trim().is_empty()
-    {
-        return Err(ServerError::Invalid(
-            "server mode requires a server-only configuration file; client settings were found"
-                .to_owned(),
-        ));
-    }
-    if let Some(bind) = bind_override {
-        let bind = bind.trim().to_owned();
-        // An explicit IPv4 endpoint cannot provide an IPv6 dual-stack
-        // listener.  Treat the override as an intentional narrowing of the
-        // exposure surface instead of making the otherwise valid CLI command
-        // fail against the default `dual_stack = true` setting.
-        if bind.parse::<std::net::Ipv4Addr>().is_ok() {
+fn configured_handshake(config: &AppConfig) -> Result<ServerHandshakeConfig, ServerError> {
+    Ok(ServerHandshakeConfig::from_config(
+        config.secret_key()?,
+        crate::security::Identity::from_hex(
+            &config.security.server_static_private_key,
+            &config.security.server_static_public_key,
+        )?,
+        Duration::from_secs(config.security.clock_skew_seconds),
+        config
+            .security
+            .custom_headers
+            .iter()
+            .map(|(name, value)| Header {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+        &config.security.allowed_clients,
+        &config.hosts.iter().map(HostConfig::host_id).collect(),
+    )?)
+}
+
+fn apply_listener_overrides(config: &mut AppConfig, bind: Option<&str>, port: Option<u16>) {
+    if let Some(bind) = bind {
+        config.server.bind_address = bind.trim().to_owned();
+        if bind.trim().parse::<std::net::Ipv4Addr>().is_ok() {
             config.server.dual_stack = false;
         }
-        config.server.bind_address = bind;
     }
-    if let Some(port) = port_override {
+    if let Some(port) = port {
         config.server.port = port;
     }
-    config.validate()?;
+}
 
-    let psk = config.secret_key()?;
-    let identity = crate::security::Identity::from_hex(
-        &config.security.server_static_private_key,
-        &config.security.server_static_public_key,
-    )?;
-    let headers = config
-        .security
-        .custom_headers
-        .iter()
-        .map(|(name, value)| Header {
-            name: name.clone(),
-            value: value.clone(),
-        })
-        .collect::<Vec<_>>();
-    let host_ids = config
-        .hosts
-        .iter()
-        .map(HostConfig::host_id)
-        .collect::<HashSet<_>>();
-    let handshake = ServerHandshakeConfig::from_config(
-        psk,
-        identity,
-        Duration::from_secs(config.security.clock_skew_seconds),
-        headers,
-        &config.security.allowed_clients,
-        &host_ids,
-    )?;
-    let runtime = ServerRuntime::new_with_components(
+fn load_server_runtime(
+    config_path: &Path,
+    bind: Option<String>,
+    port: Option<u16>,
+    metrics: ServerMetrics,
+) -> Result<ServerRuntime, ServerError> {
+    let config_path = resolve_server_config_path(config_path)?;
+    let mut config = AppConfig::load(&config_path)?;
+    apply_listener_overrides(&mut config, bind.as_deref(), port);
+    let handshake = configured_handshake(&config)?;
+    let mut runtime = ServerRuntime::new_with_components_and_metrics(
         config,
         handshake,
         Arc::new(PlatformWakeSender),
         Arc::new(PlatformStatusProbe),
+        metrics,
     )?
     .with_access_policy_source(config_path);
-    runtime.run()
+    runtime.bind_override = bind;
+    runtime.port_override = port;
+    Ok(runtime)
+}
+
+fn run_server_inner(
+    config_path: &Path,
+    bind: Option<String>,
+    port: Option<u16>,
+) -> Result<(), ServerError> {
+    load_server_runtime(config_path, bind, port, ServerMetrics::default())?.run()
 }
 
 /// TUI-only variant of [`run_server`] with an explicit listener lifecycle.
@@ -2175,69 +2454,11 @@ fn run_server_with_shutdown_inner(
     config_path: &Path,
     bind_override: Option<String>,
     port_override: Option<u16>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     metrics: ServerMetrics,
 ) -> Result<(), ServerError> {
-    let config_path = resolve_server_config_path(config_path)?;
-    let mut config = AppConfig::load(&config_path)?;
-    if !config.client.address.trim().is_empty()
-        || !config.client.client_id.trim().is_empty()
-        || !config.client.static_private_key.trim().is_empty()
-        || !config.client.static_public_key.trim().is_empty()
-        || !config.client.pinned_server_static_key.trim().is_empty()
-    {
-        return Err(ServerError::Invalid(
-            "server mode requires a server-only configuration file; client settings were found"
-                .to_owned(),
-        ));
-    }
-    if let Some(bind) = bind_override {
-        let bind = bind.trim().to_owned();
-        if bind.parse::<std::net::Ipv4Addr>().is_ok() {
-            config.server.dual_stack = false;
-        }
-        config.server.bind_address = bind;
-    }
-    if let Some(port) = port_override {
-        config.server.port = port;
-    }
-    config.validate()?;
-    let psk = config.secret_key()?;
-    let identity = crate::security::Identity::from_hex(
-        &config.security.server_static_private_key,
-        &config.security.server_static_public_key,
-    )?;
-    let headers = config
-        .security
-        .custom_headers
-        .iter()
-        .map(|(name, value)| Header {
-            name: name.clone(),
-            value: value.clone(),
-        })
-        .collect::<Vec<_>>();
-    let host_ids = config
-        .hosts
-        .iter()
-        .map(HostConfig::host_id)
-        .collect::<HashSet<_>>();
-    let handshake = ServerHandshakeConfig::from_config(
-        psk,
-        identity,
-        Duration::from_secs(config.security.clock_skew_seconds),
-        headers,
-        &config.security.allowed_clients,
-        &host_ids,
-    )?;
-    let runtime = ServerRuntime::new_with_components_and_metrics(
-        config,
-        handshake,
-        Arc::new(PlatformWakeSender),
-        Arc::new(PlatformStatusProbe),
-        metrics,
-    )?
-    .with_access_policy_source(config_path);
-    runtime.run_with_shutdown(shutdown)
+    load_server_runtime(config_path, bind_override, port_override, metrics)?
+        .run_with_shutdown(shutdown)
 }
 
 fn resolve_server_config_path(config_path: &Path) -> Result<PathBuf, ServerError> {
@@ -2259,7 +2480,8 @@ fn resolve_server_config_path_from(
             "server configuration is missing; run the interactive server setup first".to_owned(),
         ));
     }
-    candidate.canonicalize().map_err(ServerError::Io)
+    // Preserve the final directory entry for the non-following private read.
+    Ok(candidate)
 }
 
 fn with_service_logging<T>(
@@ -2372,17 +2594,28 @@ fn reserve_wake_targets_for_client(
     true
 }
 
-fn catalog_version(summaries: &[HostSummary]) -> u64 {
+fn catalog_version(hosts: &[HostConfig]) -> Result<u64, ServerError> {
     let mut hasher = Sha256::new();
-    hasher.update(b"RemoteOpenPower/catalog/v1\0");
-    for host in summaries {
-        hash_bytes(&mut hasher, host.host_id.as_bytes());
-    }
+    hasher.update(b"RemoteOpenPower/catalog/v2\0");
+    hasher.update(serde_json::to_vec(hosts).map_err(|error| {
+        ServerError::Invalid(format!("cannot encode catalog identity: {error}"))
+    })?);
     let digest: [u8; 32] = hasher.finalize().into();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     let value = u64::from_be_bytes(bytes);
-    if value == 0 { 1 } else { value }
+    Ok(if value == 0 { 1 } else { value })
+}
+
+fn retire_monitors(monitors: &mut [Monitor], operation_id: [u8; 16], attempt: u8) {
+    for monitor in monitors {
+        if monitor.operation_id == operation_id && monitor.attempt <= attempt {
+            monitor.deadline = Instant::now();
+            if let Some(probe) = &monitor.probe {
+                probe.cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
 }
 
 fn directory_summary(host: &HostConfig) -> HostSummary {
@@ -2418,6 +2651,7 @@ fn monitor_sleep(monitors: &[Monitor]) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("server_tests.rs");
 
     struct NoopWakeSender;
 
@@ -2451,10 +2685,7 @@ mod tests {
                 .expect("relative config path resolves");
 
         assert!(resolved.is_absolute());
-        assert_eq!(
-            resolved,
-            config_path.canonicalize().expect("canonical test path")
-        );
+        assert_eq!(resolved, config_path);
         std::fs::remove_file(&config_path).expect("remove test config");
         std::fs::remove_dir(&directory).expect("remove test directory");
     }
@@ -2472,17 +2703,15 @@ mod tests {
             allowed_hosts: vec!["lab-pc".to_owned()],
             issued_credential_file: String::new(),
         }];
-        let mut policy = AccessPolicy::new(
-            client_access_from_config(&config).expect("build initial access policy"),
-        );
+        let mut clients = client_access_from_config(&config).expect("build initial access policy");
         assert_eq!(
-            policy.clients.get(&key).map(|access| &access.allowed_hosts),
+            clients.get(&key).map(|access| &access.allowed_hosts),
             Some(&HashSet::from(["lab-pc".to_owned()]))
         );
 
         config.security.allowed_clients.clear();
-        policy.clients = client_access_from_config(&config).expect("reload revoked access policy");
-        assert!(!policy.clients.contains_key(&key));
+        clients = client_access_from_config(&config).expect("reload revoked access policy");
+        assert!(!clients.contains_key(&key));
     }
 
     #[test]

@@ -2,10 +2,10 @@ use std::{
     collections::VecDeque,
     io::{IsTerminal, stdout},
     net::IpAddr,
-    panic,
     time::{Duration, Instant},
 };
 
+use chrono::Local;
 use crossterm::{
     cursor::{Hide, MoveTo, SetCursorStyle, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -26,7 +26,6 @@ use ratatui::{
         TableState, Wrap,
     },
 };
-use chrono::Local;
 use tui_input::{Input, backend::crossterm::EventHandler};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
@@ -109,14 +108,6 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         restore_terminal();
     }
-}
-
-fn install_panic_hook() {
-    let previous = panic::take_hook();
-    panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        previous(info);
-    }));
 }
 
 fn restore_terminal() {
@@ -338,6 +329,14 @@ enum WakePhase {
     Waiting,
     Retrying,
     Complete,
+    Partial,
+    Failed,
+}
+
+impl WakePhase {
+    fn finished(self) -> bool {
+        matches!(self, Self::Complete | Self::Partial | Self::Failed)
+    }
 }
 
 struct App {
@@ -390,6 +389,7 @@ struct App {
     wake_deadline: Instant,
     wake_receipt: bool,
     wake_online: Vec<bool>,
+    wake_rejected: Vec<bool>,
     credential_display: String,
     credential_status: String,
     connection_phase: ClientConnectionPhase,
@@ -465,6 +465,7 @@ impl App {
             wake_deadline: now + Duration::from_secs(60),
             wake_receipt: false,
             wake_online: Vec::new(),
+            wake_rejected: Vec::new(),
             credential_display: "remote-open-power.credential.toml".into(),
             credential_status: "未发现凭据文件".into(),
             connection_phase: ClientConnectionPhase::Disconnected,
@@ -1313,7 +1314,7 @@ impl App {
 
     fn handle_wake(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter if self.wake_phase == WakePhase::Complete => {
+            KeyCode::Enter if self.wake_phase.finished() => {
                 for host in &mut self.hosts {
                     if host.selected {
                         host.selected = false;
@@ -1333,6 +1334,7 @@ impl App {
         self.wake_deadline = self.wake_started_at + Duration::from_secs(60);
         self.wake_receipt = false;
         self.wake_online = vec![false; selected];
+        self.wake_rejected = vec![false; selected];
     }
 
     fn handle_save_exit(&mut self, key: KeyEvent) {
@@ -1429,8 +1431,7 @@ fn validate_listen_address(value: &str, ipv6: Option<bool>) -> Result<(), String
 }
 
 fn validate_header(name: &str, value: &str) -> Result<(), String> {
-    crate::config::validate_header(name, value)
-        .map_err(|error| format!("Header 无效: {error}"))
+    crate::config::validate_header(name, value).map_err(|error| format!("Header 无效: {error}"))
 }
 
 fn validate_credential_form(label: &str, output: &str, allowed: usize) -> Result<(), String> {
@@ -1643,9 +1644,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (Screen::CredentialIssue, true) => "Tab区域  Space选择  Ctrl+S签发  Esc取消",
         (Screen::ServerRunning, true) => "1..5切页  PgUp/PgDn滚动  End跟随  c清屏  q停止",
         (Screen::ClientConnect, true) => "Tab字段  Enter连接  Esc返回",
-        (Screen::ClientHosts, true)
-            if app.connection_phase != ClientConnectionPhase::Connected =>
-        {
+        (Screen::ClientHosts, true) if app.connection_phase != ClientConnectionPhase::Connected => {
             "自动重连中  Esc取消"
         }
         (Screen::ClientHosts, true) => "↑↓选择  Space勾选  a批选  r刷新  Enter唤醒  Esc断开",
@@ -1678,9 +1677,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (Screen::ClientHosts, false) => {
             "↑↓ 选择   Space 勾选   a 批量选择   r 刷新   Enter 唤醒   Esc 断开"
         }
-        (Screen::Wake, false) => {
-            "等待服务端回执与在线状态   Enter 完成后返回   Esc 取消等待"
-        }
+        (Screen::Wake, false) => "等待服务端回执与在线状态   Enter 完成后返回   Esc 取消等待",
         (Screen::SaveExit, false) => "1..5 切页   s/Enter 再次保存   q 退出   Esc 返回",
     };
     let line = if let Some((message, _)) = &app.toast {
@@ -2547,11 +2544,13 @@ fn render_client_hosts(frame: &mut Frame<'_>, app: &App, area: Rect) {
         app.connection_error_code.as_deref(),
         app.connection_error_message.as_deref(),
     ) {
-        let retry = app.connection_retry_at.map_or_else(String::new, |deadline| {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let seconds = remaining.as_millis().div_ceil(1_000);
-            format!("     {seconds}s 后重试")
-        });
+        let retry = app
+            .connection_retry_at
+            .map_or_else(String::new, |deadline| {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let seconds = remaining.as_millis().div_ceil(1_000);
+                format!("     {seconds}s 后重试")
+            });
         connection_lines.push(Line::from(vec![
             Span::styled(format!("错误 [{code}]  "), Style::default().fg(Color::Red)),
             Span::styled(message, Style::default().fg(Color::Red)),
@@ -2622,7 +2621,7 @@ fn render_wake(frame: &mut Frame<'_>, app: &App, area: Rect) {
     .spacing(1)
     .areas(area);
     let now = Instant::now();
-    let remaining = if app.wake_phase == WakePhase::Complete {
+    let remaining = if app.wake_phase.finished() {
         0
     } else {
         app.wake_deadline
@@ -2636,6 +2635,8 @@ fn render_wake(frame: &mut Frame<'_>, app: &App, area: Rect) {
         WakePhase::Waiting => "等待目标上线",
         WakePhase::Retrying => "正在申请唯一一次重发",
         WakePhase::Complete => "唤醒完成",
+        WakePhase::Partial => "部分目标失败",
+        WakePhase::Failed => "唤醒失败",
     };
     let phase_color = if app.wake_phase == WakePhase::Complete {
         GREEN
@@ -2674,9 +2675,17 @@ fn render_wake(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     let target_rows = app.wake_targets().enumerate().map(|(index, host)| {
         let online = app.wake_online.get(index).copied().unwrap_or(false);
+        let rejected = app.wake_rejected.get(index).copied().unwrap_or(false);
         Row::new([
             host.id.clone(),
-            if online { "ONLINE" } else { "WAITING" }.into(),
+            if online {
+                "ONLINE"
+            } else if rejected {
+                "REJECTED"
+            } else {
+                "WAITING"
+            }
+            .into(),
         ])
         .style(Style::default().fg(if online { GREEN } else { Color::White }))
     });
@@ -2690,11 +2699,8 @@ fn render_wake(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .block(panel(" 目标 ")),
         targets,
     );
-    let (ratio, gauge_label, gauge_color) = wake_gauge_presentation(
-        app.wake_phase,
-        elapsed,
-        remaining,
-    );
+    let (ratio, gauge_label, gauge_color) =
+        wake_gauge_presentation(app.wake_phase, elapsed, remaining);
     let [gauge] = Layout::horizontal([Constraint::Length(18)])
         .flex(ratatui::layout::Flex::Center)
         .areas(timeline);
@@ -2707,13 +2713,11 @@ fn render_wake(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn wake_gauge_presentation(
-    phase: WakePhase,
-    elapsed: u64,
-    remaining: u64,
-) -> (f64, String, Color) {
+fn wake_gauge_presentation(phase: WakePhase, elapsed: u64, remaining: u64) -> (f64, String, Color) {
     if phase == WakePhase::Complete {
         (1.0, "OK".to_owned(), GREEN)
+    } else if phase.finished() {
+        (1.0, "FAILED".to_owned(), Color::Red)
     } else {
         (
             (elapsed.min(60) as f64 / 60.0).clamp(0.0, 1.0),
@@ -2767,7 +2771,14 @@ fn render_save_exit(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("配置状态  ", Style::default().fg(MUTED)),
-                Span::styled("已自动保存", Style::default().fg(GREEN)),
+                Span::styled(
+                    &app.config_status,
+                    Style::default().fg(if app.config_status == "已保存" {
+                        GREEN
+                    } else {
+                        YELLOW
+                    }),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("服务端公钥  ", Style::default().fg(MUTED)),
@@ -2839,10 +2850,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, modal: Modal, area: Rect) {
                     .map_or("当前凭据", |client| client.label.as_str())
             ),
         ),
-        Modal::StopServer => (
-            " 停止服务 ",
-            "确认停止服务监听并返回管理页面？".into(),
-        ),
+        Modal::StopServer => (" 停止服务 ", "确认停止服务监听并返回管理页面？".into()),
         Modal::Exit => (" 退出 TUI ", "确认退出 TUI？".into()),
     };
     let popup = centered_rect(54, 9, area);
@@ -2950,10 +2958,7 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ("PgUp / PgDn", "滚动实时事件"),
             ("End", "恢复跟随最新事件"),
             ("c", "清空本地日志视图"),
-            (
-                "q / Esc",
-                "停止服务监听并返回",
-            ),
+            ("q / Esc", "停止服务监听并返回"),
         ],
         Screen::ClientConnect => &[
             ("Tab / ↑ / ↓", "切换服务端地址和端口"),
@@ -2962,14 +2967,8 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ],
         Screen::ClientHosts => &[
             ("↑ / ↓", "选择主机"),
-            (
-                "Space / a",
-                "勾选当前主机或按协议上限批量选择",
-            ),
-            (
-                "r",
-                "从服务端刷新状态",
-            ),
+            ("Space / a", "勾选当前主机或按协议上限批量选择"),
+            ("r", "从服务端刷新状态"),
             ("Enter", "唤醒已勾选主机"),
             ("Esc", "断开并返回连接页面"),
         ],
@@ -2980,10 +2979,7 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ],
         Screen::SaveExit => &[
             ("s / Enter", "再次保存配置"),
-            (
-                "q",
-                "退出 TUI",
-            ),
+            ("q", "退出 TUI"),
             ("Esc", "返回服务端管理"),
             ("部署", "页面只展示当前平台信息，不执行任何命令"),
         ],
@@ -3044,13 +3040,7 @@ fn render_input(
     }
 }
 
-fn set_inline_input_cursor(
-    frame: &mut Frame<'_>,
-    x: u16,
-    y: u16,
-    width: u16,
-    input: &Input,
-) {
+fn set_inline_input_cursor(frame: &mut Frame<'_>, x: u16, y: u16, width: u16, input: &Input) {
     let cursor_width = width.saturating_sub(1).max(1) as usize;
     let scroll = input.visual_scroll(cursor_width);
     let cursor = input.visual_cursor().max(scroll).saturating_sub(scroll);

@@ -1,29 +1,47 @@
+#[cfg(test)]
+mod cli_tests;
 mod client;
 mod config;
 mod logging;
+mod private_file;
 mod probe;
 mod protocol;
 mod security;
 mod server;
+#[cfg(test)]
+mod test_support;
 mod tui;
+mod wake;
 mod wol;
 
 use clap::Parser;
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, IsTerminal, Write},
+    io::{self, Write},
     path::PathBuf,
     thread,
     time::{Duration, Instant},
 };
 
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const CYAN: &str = "\x1b[36m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-const DIM: &str = "\x1b[2m";
+struct AnsiStyle(&'static str);
+
+impl std::fmt::Display for AnsiStyle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if tui::cli_color_enabled() {
+            formatter.write_str(self.0)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+const RESET: AnsiStyle = AnsiStyle("\x1b[0m");
+const BOLD: AnsiStyle = AnsiStyle("\x1b[1m");
+const CYAN: AnsiStyle = AnsiStyle("\x1b[36m");
+const GREEN: AnsiStyle = AnsiStyle("\x1b[32m");
+const YELLOW: AnsiStyle = AnsiStyle("\x1b[33m");
+const RED: AnsiStyle = AnsiStyle("\x1b[31m");
+const DIM: AnsiStyle = AnsiStyle("\x1b[2m");
 const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
 
 #[cfg(windows)]
@@ -64,7 +82,11 @@ struct Cli {
 
 fn main() {
     logging::install_panic_hook();
-    if let Err(error) = run() {
+    exit_on_error(run());
+}
+
+fn exit_on_error(result: Result<(), String>) {
+    if let Err(error) = result {
         eprintln!("{RED}error:{RESET} {error}");
         std::process::exit(1);
     }
@@ -189,7 +211,7 @@ impl HostTableView {
         let mut view = Self {
             hosts: hosts.to_vec(),
             statuses: statuses.clone(),
-            interactive: io::stdout().is_terminal(),
+            interactive: tui::cli_cursor_enabled(),
             rendered: false,
             finished: false,
             footer: String::new(),
@@ -309,7 +331,7 @@ impl WakePanel {
         let mut panel = Self {
             targets: ordered_targets,
             states,
-            interactive: io::stdout().is_terminal(),
+            interactive: tui::cli_cursor_enabled(),
             rendered: false,
             finished: false,
             footer: String::new(),
@@ -438,11 +460,10 @@ fn run_wake_session(
 
     let mut attempt = 1u8;
     let mut ticket = None;
-    let mut active_targets = targets.clone();
-    let mut online = HashSet::new();
+    let target_ids = targets.iter().cloned().collect::<Vec<_>>();
+    let mut progress = wake::Progress::new(Instant::now());
     let mut receipt = false;
     let mut receipt_deadline = Instant::now() + client::RECEIPT_TIMEOUT;
-    let mut deadline = receipt_deadline;
     loop {
         while let Ok(event) = handle.events.try_recv() {
             match event {
@@ -466,24 +487,19 @@ fn run_wake_session(
                             if result.accepted { "SENT" } else { "REJECTED" },
                         );
                     }
-                    active_targets = results
-                        .iter()
-                        .filter(|result| result.accepted)
-                        .map(|result| result.host_id.clone())
-                        .collect();
-                    if active_targets.is_empty() {
+                    progress.receive(&results, Instant::now());
+                    if progress.accepted.is_empty() {
                         panel.finish("  失败: 服务端拒绝了全部目标");
-                        return Ok(());
+                        return Err("服务端拒绝了全部目标".into());
                     }
                     // Retry timing belongs to the client. The server deadline
                     // only bounds its online observations; it must never
                     // shorten or extend either local one-minute wait window.
-                    deadline = Instant::now() + client::WAKE_WAIT_TIMEOUT;
                     panel.set_footer(&format!(
                         "  attempt={}  已收到执行回执 | 在线 {}/{} | 本地等待 60s",
                         attempt,
-                        online.len(),
-                        active_targets.len()
+                        progress.online.len(),
+                        targets.len()
                     ));
                 }
                 client::ClientEvent::TargetOnline {
@@ -493,9 +509,9 @@ fn run_wake_session(
                     ..
                 } if event_operation == operation_id
                     && event_attempt == attempt
-                    && active_targets.contains(&host_id) =>
+                    && progress.accepted.contains(&host_id) =>
                 {
-                    online.insert(host_id.clone());
+                    progress.observe(&host_id);
                     panel.set_state(&host_id, "ONLINE");
                 }
                 client::ClientEvent::Error(error) => {
@@ -508,18 +524,25 @@ fn run_wake_session(
                 _ => {}
             }
         }
-        if !active_targets.is_empty() && online.len() == active_targets.len() {
-            panel.finish("  {GREEN}{BOLD}完成: 全部目标已上线{RESET}");
-            return Ok(());
+        match progress.outcome(&target_ids) {
+            wake::Outcome::Complete => {
+                panel.finish("  OK: 全部目标已上线");
+                return Ok(());
+            }
+            wake::Outcome::Partial => {
+                panel.finish("  失败: 部分目标被拒绝");
+                return Err("部分目标被拒绝".into());
+            }
+            wake::Outcome::Rejected | wake::Outcome::Waiting => {}
         }
         if !receipt && Instant::now() >= receipt_deadline {
-            panel.finish("  {RED}失败: 等待服务端执行回执超时{RESET}");
-            return Ok(());
+            panel.finish("  失败: 等待服务端执行回执超时");
+            return Err("等待服务端执行回执超时".into());
         }
-        if receipt && Instant::now() >= deadline {
+        if receipt && Instant::now() >= progress.deadline {
             if attempt == 1 {
                 let Some(retry_ticket) = ticket else {
-                    panel.finish("  {RED}失败: 服务端未返回 retry ticket{RESET}");
+                    panel.finish("  失败: 服务端未返回 retry ticket");
                     return Err("服务端未返回 retry ticket".to_owned());
                 };
                 panel.set_states(targets.iter(), "RETRYING");
@@ -535,23 +558,24 @@ fn run_wake_session(
                     })
                     .is_err()
                 {
-                    panel.finish("  {RED}失败: 客户端 actor 已退出{RESET}");
+                    panel.finish("  失败: 客户端 actor 已退出");
                     return Err("客户端 actor 已退出".to_owned());
                 }
                 attempt = 2;
                 receipt = false;
-                online.clear();
-                active_targets = targets.clone();
+                progress = wake::Progress::new(Instant::now());
                 receipt_deadline = Instant::now() + client::RECEIPT_TIMEOUT;
-                deadline = receipt_deadline;
                 panel.set_footer("  attempt=2  一分钟未全部上线，已按授权票据重试");
             } else {
-                panel.finish("  {RED}失败: 两次等待均超时{RESET}");
-                return Ok(());
+                panel.finish("  失败: 两次等待均超时");
+                return Err("两次等待均超时".into());
             }
         }
         let remaining = if receipt {
-            deadline.saturating_duration_since(Instant::now()).as_secs()
+            progress
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs()
         } else {
             receipt_deadline
                 .saturating_duration_since(Instant::now())
@@ -560,8 +584,8 @@ fn run_wake_session(
         panel.set_footer(&format!(
             "  attempt={}  在线 {}/{}  剩余={}s",
             attempt,
-            online.len(),
-            active_targets.len(),
+            progress.online.len(),
+            targets.len(),
             remaining
         ));
         thread::sleep(Duration::from_millis(100));
@@ -574,7 +598,7 @@ fn run_client_cli(cli: &Cli) -> Result<(), String> {
     if let Some(label) = runtime.device_label.as_deref() {
         println!("  credential label  {label}  {DIM}(仅供显示，不参与授权){RESET}");
     }
-    let handle = client::spawn_client(runtime);
+    let handle = client::spawn_client(runtime).map_err(|error| error.to_string())?;
     if cli.wake.is_empty() {
         let result = receive_catalog(&handle).map(|_| ());
         request_client_shutdown(&handle);
@@ -612,6 +636,9 @@ fn request_client_shutdown(handle: &client::ClientHandle) {
 }
 
 fn spinner_line(message: &str) {
+    if !tui::cli_cursor_enabled() {
+        return;
+    }
     static TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     print!(
@@ -628,7 +655,7 @@ fn spinner_line(message: &str) {
 }
 
 fn update_line_from_bottom(lines_up: usize, text: &str) {
-    if lines_up == 0 || !io::stdout().is_terminal() {
+    if lines_up == 0 || !tui::cli_cursor_enabled() {
         return;
     }
     print!("\x1b[s\x1b[{}A\r\x1b[2K{}\x1b[u", lines_up, text);

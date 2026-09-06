@@ -6,8 +6,10 @@ These rules apply to every source, test, build, and documentation change in this
 
 - Do not ignore compiler warnings, Clippy findings, test failures, I/O errors, or failed cleanup. Fix the owning design or propagate the error with useful context.
 - Do not use `allow` attributes, dummy reads, empty branches, or disabled code as a way to silence a warning.
+- User-approved exception: Zig's `ignoring deprecated linker optimization setting '1'` warning does not block completion. Keep it visible; do not suppress other linker diagnostics.
 - Before completion, run formatting, all-target tests, Clippy with `-D warnings`, and a Linux cross-build. A change is incomplete if any supported target does not compile.
 - Keep Cargo cache, rustup data, and temporary build files under `E:\Catch\Cargo`; keep final artifacts under this repository's `target` directory.
+- Do not use WSL, including discovery or test commands. Cross-build Linux with the Zig toolchain on `G:`; report Linux-native runtime checks as unverified when no authorized native environment is available.
 
 ## Design Consistency
 

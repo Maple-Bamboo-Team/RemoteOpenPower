@@ -269,17 +269,16 @@ pub fn remove_issued_credential_bundle(
     {
         return Err(ClientError::Credential);
     }
-    let Some(bundle) = load_credential_bundle(path)? else {
-        return Ok(false);
-    };
-    let identity = bundle.validate()?;
     let expected =
         crate::config::decode_key(expected_public_key).map_err(|_| ClientError::Credential)?;
-    if identity.public != expected {
-        return Err(ClientError::Credential);
-    }
-    std::fs::remove_file(path)?;
-    Ok(true)
+    crate::private_file::remove_verified(path, MAX_CREDENTIAL_BYTES, |text| {
+        let bundle: CredentialBundle = toml::from_str(text).map_err(|_| ClientError::Credential)?;
+        let identity = bundle.validate()?;
+        if identity.public != expected {
+            return Err(ClientError::Credential);
+        }
+        Ok(())
+    })
 }
 
 fn apply_credential_bundle(
@@ -471,21 +470,61 @@ impl std::fmt::Debug for ClientEvent {
 pub struct ClientHandle {
     pub commands: Sender<ClientCommand>,
     pub events: Receiver<ClientEvent>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
-pub fn spawn_client(config: ClientRuntimeConfig) -> ClientHandle {
+impl ClientHandle {
+    pub fn shutdown(&mut self) -> Result<(), ClientError> {
+        if let Some(worker) = self.worker.take() {
+            // A closed command receiver means the actor has already exited.
+            match self.commands.send(ClientCommand::Shutdown) {
+                Ok(()) | Err(mpsc::SendError(ClientCommand::Shutdown)) => {}
+                Err(_) => unreachable!("only Shutdown was sent"),
+            }
+            worker
+                .join()
+                .map_err(|_| io::Error::other("client actor panicked"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_channels(
+        commands: Sender<ClientCommand>,
+        events: Receiver<ClientEvent>,
+    ) -> Self {
+        Self {
+            commands,
+            events,
+            worker: None,
+        }
+    }
+}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            crate::logging::log(
+                crate::logging::Level::Fatal,
+                format!("client shutdown failed: {error}"),
+            );
+        }
+    }
+}
+
+pub fn spawn_client(config: ClientRuntimeConfig) -> Result<ClientHandle, ClientError> {
     let (command_tx, command_rx) = mpsc::channel();
     // A bounded event queue prevents an authenticated peer from growing the
     // client process without limit when the CLI is busy rendering output.
     let (event_tx, event_rx) = mpsc::sync_channel(256);
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("rop-client".to_owned())
-        .spawn(move || client_actor(config, command_rx, event_tx))
-        .expect("client actor thread");
-    ClientHandle {
+        .spawn(move || client_actor(config, command_rx, event_tx))?;
+    Ok(ClientHandle {
         commands: command_tx,
         events: event_rx,
-    }
+        worker: Some(worker),
+    })
 }
 
 fn client_actor(
@@ -513,8 +552,8 @@ fn client_actor(
         {
             return;
         }
-        let endpoint = match resolve_endpoint(&address, port) {
-            Ok(endpoint) => endpoint,
+        let endpoints = match resolve_endpoints(&address, port) {
+            Ok(endpoints) => endpoints,
             Err(error) => {
                 if !report_connection_failure(
                     &commands,
@@ -529,8 +568,9 @@ fn client_actor(
                 continue;
             }
         };
-        let stream = match TcpStream::connect_timeout(&endpoint, CONNECT_TIMEOUT) {
-            Ok(stream) => stream,
+        let stream = match connect_endpoints(&endpoints, &commands) {
+            Ok(None) => break,
+            Ok(Some(stream)) => stream,
             Err(error) => {
                 if !report_connection_failure(
                     &commands,
@@ -989,7 +1029,12 @@ fn handle_server_event(
                 return reject_server_event(secure, events);
             }
             let now = now_ms();
-            if deadline_ms < now.saturating_sub(95_000) || deadline_ms > now.saturating_add(120_000)
+            let skew_ms = configured_clock_skew.as_millis() as u64;
+            if deadline_ms < now.saturating_sub(skew_ms)
+                || deadline_ms
+                    > now
+                        .saturating_add(WAKE_WAIT_TIMEOUT.as_millis() as u64)
+                        .saturating_add(skew_ms)
             {
                 return reject_server_event(secure, events);
             }
@@ -1003,6 +1048,7 @@ fn handle_server_event(
             if operation.receipt_seen {
                 // Duplicate authenticated receipts are harmless but should
                 // not be surfaced repeatedly to the CLI state machine.
+                operation.deadline_ms = Some(deadline_ms);
                 return true;
             }
             if attempt == 1 {
@@ -1051,13 +1097,12 @@ fn handle_server_event(
                 return reject_server_event(secure, events);
             }
             let now = now_ms();
-            if observed_at_ms < now.saturating_sub(90_000)
-                || observed_at_ms > now.saturating_add(5_000)
-                || operation.deadline_ms.is_none_or(|deadline| {
-                    observed_at_ms > deadline.saturating_add(5_000)
-                        || now > deadline.saturating_add(5_000)
-                })
-            {
+            if !observation_time_valid(
+                observed_at_ms,
+                operation.deadline_ms,
+                now,
+                configured_clock_skew,
+            ) {
                 return reject_server_event(secure, events);
             }
             let already_online = operation.online.contains(&host_id);
@@ -1095,6 +1140,16 @@ fn handle_server_event(
         }
     }
     true
+}
+
+fn observation_time_valid(observed: u64, deadline: Option<u64>, now: u64, skew: Duration) -> bool {
+    let skew = skew.as_millis() as u64;
+    let window = WAKE_WAIT_TIMEOUT.as_millis() as u64;
+    observed != 0
+        && observed <= now.saturating_add(skew)
+        && observed >= now.saturating_sub(window.saturating_add(skew))
+        && deadline
+            .is_some_and(|deadline| observed <= deadline && now <= deadline.saturating_add(skew))
 }
 
 fn emit_event(
@@ -1212,7 +1267,7 @@ pub fn headers_from_map(map: &BTreeMap<String, String>) -> Result<Vec<Header>, C
     Ok(crate::protocol::canonical_headers(headers).map_err(SecurityError::from)?)
 }
 
-pub fn resolve_endpoint(address: &str, port: u16) -> Result<SocketAddr, ClientError> {
+fn resolve_endpoints(address: &str, port: u16) -> Result<Vec<SocketAddr>, ClientError> {
     if port < 1024 || crate::config::validate_endpoint(address).is_err() {
         return Err(ClientError::Endpoint);
     }
@@ -1220,14 +1275,54 @@ pub fn resolve_endpoint(address: &str, port: u16) -> Result<SocketAddr, ClientEr
         if ip.is_unspecified() || ip.is_multicast() {
             return Err(ClientError::Endpoint);
         }
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    let mut resolved = (address, port)
+    let resolved = (address, port)
         .to_socket_addrs()
         .map_err(|_| ClientError::Endpoint)?;
-    resolved
-        .find(|endpoint| !endpoint.ip().is_unspecified() && !endpoint.ip().is_multicast())
-        .ok_or(ClientError::Endpoint)
+    let mut endpoints = Vec::new();
+    for endpoint in
+        resolved.filter(|endpoint| !endpoint.ip().is_unspecified() && !endpoint.ip().is_multicast())
+    {
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+        if endpoints.len() == 16 {
+            break;
+        }
+    }
+    if endpoints.is_empty() {
+        Err(ClientError::Endpoint)
+    } else {
+        Ok(endpoints)
+    }
+}
+
+fn connect_endpoints(
+    endpoints: &[SocketAddr],
+    commands: &Receiver<ClientCommand>,
+) -> io::Result<Option<TcpStream>> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut last_error = io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "no resolved server address",
+    );
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        match commands.try_recv() {
+            Ok(ClientCommand::Shutdown) | Err(TryRecvError::Disconnected) => return Ok(None),
+            Ok(_) | Err(TryRecvError::Empty) => {}
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let budget = remaining / (endpoints.len() - index) as u32;
+        match TcpStream::connect_timeout(endpoint, budget) {
+            Ok(stream) => return Ok(Some(stream)),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 pub fn random_id() -> [u8; 16] {
@@ -1284,6 +1379,51 @@ pub fn load_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_fallback_reaches_second_address_and_honors_shutdown() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = listener.local_addr().unwrap();
+        let (commands, receiver) = mpsc::channel();
+        let connected = connect_endpoints(&[first, second], &receiver)
+            .unwrap()
+            .unwrap();
+        assert_eq!(connected.peer_addr().unwrap(), second);
+        commands.send(ClientCommand::Shutdown).unwrap();
+        assert!(connect_endpoints(&[second], &receiver).unwrap().is_none());
+    }
+
+    #[test]
+    fn online_observation_respects_configured_clock_skew() {
+        let now = 1_000_000;
+        for seconds in [1, 5, 30, 60] {
+            let skew = Duration::from_secs(seconds);
+            let ms = seconds * 1000;
+            assert!(observation_time_valid(
+                now + ms,
+                Some(now + ms + 60_000),
+                now,
+                skew
+            ));
+            assert!(!observation_time_valid(
+                now + ms + 1,
+                Some(now + ms + 60_000),
+                now,
+                skew
+            ));
+            assert!(observation_time_valid(now - ms, Some(now - ms), now, skew));
+            assert!(!observation_time_valid(
+                now - ms - 1,
+                Some(now - ms - 1),
+                now,
+                skew
+            ));
+            assert!(!observation_time_valid(now + 1, Some(now), now, skew));
+        }
+    }
     use std::{net::TcpListener, sync::mpsc::RecvTimeoutError};
 
     #[test]
@@ -1393,7 +1533,7 @@ mod tests {
             clock_skew: Duration::from_secs(30),
             device_label: None,
         };
-        let handle = spawn_client(runtime);
+        let mut handle = spawn_client(runtime).expect("client worker");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_first_attempt = false;
         let mut saw_failure = false;
@@ -1418,7 +1558,7 @@ mod tests {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        let _ = handle.commands.send(ClientCommand::Shutdown);
+        handle.shutdown().expect("client shutdown");
         assert!(saw_first_attempt);
         assert!(saw_failure);
         assert!(saw_retry);

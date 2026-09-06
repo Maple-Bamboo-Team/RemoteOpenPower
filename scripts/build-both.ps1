@@ -40,6 +40,16 @@ function Resolve-ZigPath {
         return (Resolve-Path -LiteralPath $ZigPath).Path
     }
 
+    $stableZigDirectories = Get-ChildItem -LiteralPath 'G:\Program Files' -Directory -Filter 'zig-x86_64-windows-*' |
+        Where-Object { $_.Name -match '^zig-x86_64-windows-\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]($_.Name -replace '^zig-x86_64-windows-', '') } -Descending
+    foreach ($directory in $stableZigDirectories) {
+        $executable = Join-Path $directory.FullName 'zig.exe'
+        if (Test-Path -LiteralPath $executable -PathType Leaf) {
+            return $executable
+        }
+    }
+
     $command = Get-Command zig -ErrorAction SilentlyContinue
     if ($command) {
         return $command.Source
@@ -85,6 +95,8 @@ $commonEnvironment = @{
     TEMP = $tempRoot
     TMP = $tempRoot
     CARGO_ZIGBUILD_CACHE_DIR = $zigbuildCacheRoot
+    ZIG_GLOBAL_CACHE_DIR = (Join-Path $cacheRoot 'zig-global')
+    ZIG_LOCAL_CACHE_DIR = (Join-Path $cacheRoot 'zig-local')
     PATH = $toolPath
     CARGO_TERM_COLOR = 'always'
 }

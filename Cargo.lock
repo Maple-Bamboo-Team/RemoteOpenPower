@@ -22,6 +22,7 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "tui-input",
+ "windows-sys 0.61.2",
  "wol",
  "x25519-dalek",
  "zeroize",

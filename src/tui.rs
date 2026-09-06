@@ -3,13 +3,23 @@
 include!("tui_core.rs");
 
 use crate::{client, config, logging, protocol, security, server};
+
+pub(crate) fn cli_cursor_enabled() -> bool {
+    let capabilities = TerminalCapabilities::detect();
+    capabilities.is_terminal && capabilities.ansi_supported
+}
+
+pub(crate) fn cli_color_enabled() -> bool {
+    let capabilities = TerminalCapabilities::detect();
+    capabilities.is_terminal && capabilities.ansi_supported && capabilities.color_enabled
+}
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
+        mpsc::TryRecvError,
     },
     thread::{self, JoinHandle},
 };
@@ -19,7 +29,7 @@ struct ActualWake {
     boot_nonce: [u8; 16],
     catalog_version: u64,
     targets: Vec<String>,
-    accepted: HashSet<String>,
+    progress: crate::wake::Progress,
     attempt: u8,
     ticket: Option<[u8; 32]>,
     receipt: bool,
@@ -39,7 +49,7 @@ struct ProductionApp {
     server_started: bool,
     server_shutdown: Option<Arc<AtomicBool>>,
     server_thread: Option<JoinHandle<Result<(), server::ServerError>>>,
-    runtime_log_rx: Option<Receiver<String>>,
+    runtime_log_rx: Option<logging::LogReceiver>,
     server_metrics: server::ServerMetrics,
 }
 
@@ -55,9 +65,7 @@ pub fn run(config_path: &Path) -> Result<(), String> {
         return Err("当前终端不支持 ANSI 光标控制，无法启动 TUI".to_owned());
     }
 
-    install_panic_hook();
-    let (log_sender, log_receiver) = mpsc::channel();
-    let _log_guard = logging::install_sink(log_sender);
+    let (_log_guard, log_receiver) = logging::install_sink();
     enable_raw_mode().map_err(|error| format!("无法启用终端模式: {error}"))?;
     let _guard = TerminalGuard;
     let mut output = stdout();
@@ -111,10 +119,15 @@ impl ProductionApp {
                     client::credential_path(&config_path).display().to_string();
                 app.credential_status = "发现多个凭据文件，连接前必须清理".into();
             }
-            Err(_) => {
+            Err(client::ClientError::EnrollmentRequired { .. }) => {
                 app.credential_display =
                     client::credential_path(&config_path).display().to_string();
                 app.credential_status = "未发现凭据文件".into();
+            }
+            Err(error) => {
+                app.credential_display =
+                    client::credential_path(&config_path).display().to_string();
+                app.credential_status = format!("凭据检查失败: {error}");
             }
         }
         app.connection_display = "未连接".into();
@@ -325,11 +338,7 @@ impl ProductionApp {
             )
         {
             let before = self.app.screen;
-            if before == Screen::Credentials && key.code == KeyCode::Char('4') {
-                // The credentials page historically used 4 as the immediate
-                // start shortcut. Keep it outside page navigation so a
-                // failed start does not leave the UI claiming the service is
-                // running.
+            if !self.app.settings_editing && key.code == KeyCode::Char('4') {
                 self.start_server();
                 return true;
             }
@@ -423,7 +432,7 @@ impl ProductionApp {
                 true
             }
             Screen::Wake if plain && key.code == KeyCode::Enter => {
-                if self.app.wake_phase == WakePhase::Complete {
+                if self.app.wake_phase.finished() {
                     self.app.handle_event(Event::Key(key));
                     self.wake = None;
                 }
@@ -468,8 +477,7 @@ impl ProductionApp {
             && self.app.modal.is_none()
             && self.app.screen == Screen::Credentials
         {
-            let revoked = self
-                .client_acl
+            self.client_acl
                 .iter()
                 .find(|client| {
                     !self
@@ -478,14 +486,7 @@ impl ProductionApp {
                         .iter()
                         .any(|view| view.client_id == client.client_id)
                 })
-                .cloned();
-            self.client_acl.retain(|client| {
-                self.app
-                    .clients
-                    .iter()
-                    .any(|view| view.client_id == client.client_id)
-            });
-            revoked
+                .cloned()
         } else {
             None
         };
@@ -532,13 +533,14 @@ impl ProductionApp {
         if self.has_client_settings() {
             return Err("当前配置包含终端模式设置，请使用独立的服务端配置文件".to_owned());
         }
-        self.config.ensure_secret();
-        self.config
+        let mut candidate = self.config.clone();
+        candidate.ensure_secret();
+        candidate
             .ensure_server_identity_material()
             .map_err(|error| error.to_string())?;
-        self.config.client = config::ClientConfig::default();
+        candidate.client = config::ClientConfig::default();
         let previous_hosts = self.config.hosts.clone();
-        self.config.hosts = self
+        candidate.hosts = self
             .app
             .hosts
             .iter()
@@ -566,55 +568,73 @@ impl ProductionApp {
                 }
             })
             .collect();
-        let removed_permissions = self.reconcile_client_permissions();
-        self.config.security.custom_headers = self
+        candidate.security.allowed_clients = self
+            .client_acl
+            .iter()
+            .filter(|client| {
+                self.app
+                    .clients
+                    .iter()
+                    .any(|view| view.client_id == client.client_id)
+            })
+            .cloned()
+            .collect();
+        let valid_hosts = candidate
+            .hosts
+            .iter()
+            .map(config::HostConfig::host_id)
+            .collect();
+        let removed_permissions = reconcile_client_host_permissions(
+            &mut candidate.security.allowed_clients,
+            &valid_hosts,
+        );
+        candidate.security.custom_headers = self
             .app
             .headers
             .iter()
             .cloned()
             .collect::<std::collections::BTreeMap<_, _>>();
-        self.config.server.port = parse_port(self.app.server_port_input.value().trim())?;
-        self.config.security.clock_skew_seconds = self
+        candidate.server.port = parse_port(self.app.server_port_input.value().trim())?;
+        candidate.security.clock_skew_seconds = self
             .app
             .clock_skew_input
             .value()
             .trim()
             .parse::<u64>()
             .map_err(|_| "时钟容差必须是 1 到 60 的整数".to_owned())?;
-        if !(1..=60).contains(&self.config.security.clock_skew_seconds) {
+        if !(1..=60).contains(&candidate.security.clock_skew_seconds) {
             return Err("时钟容差必须在 1 到 60 秒之间".to_owned());
         }
         match self.app.listen_mode {
             ListenMode::Custom => {
                 let value = self.app.custom_bind_input.value().trim();
                 validate_listen_address(value, None)?;
-                self.config.server.bind_address = value.to_owned();
-                self.config.server.dual_stack = false;
+                candidate.server.bind_address = value.to_owned();
+                candidate.server.dual_stack = false;
             }
             ListenMode::V4Only => {
                 let value = self.app.bind_v4_input.value().trim();
                 validate_listen_address(value, Some(false))?;
-                self.config.server.bind_address = value.to_owned();
-                self.config.server.dual_stack = false;
+                candidate.server.bind_address = value.to_owned();
+                candidate.server.dual_stack = false;
             }
             ListenMode::V6Only => {
                 let value = self.app.bind_v6_input.value().trim();
                 validate_listen_address(value, Some(true))?;
-                self.config.server.bind_address = value.to_owned();
-                self.config.server.dual_stack = false;
+                candidate.server.bind_address = value.to_owned();
+                candidate.server.dual_stack = false;
             }
             ListenMode::DualStack => {
                 let value_v6 = self.app.bind_v6_input.value().trim();
                 validate_listen_address(value_v6, Some(true))?;
                 let value_v4 = self.app.bind_v4_input.value().trim();
                 validate_listen_address(value_v4, Some(false))?;
-                self.config.server.bind_address = value_v6.to_owned();
-                self.config.server.bind_address_v4 = value_v4.to_owned();
-                self.config.server.dual_stack = true;
+                candidate.server.bind_address = value_v6.to_owned();
+                candidate.server.bind_address_v4 = value_v4.to_owned();
+                candidate.server.dual_stack = true;
             }
         }
-        self.config
-            .save(&self.config_path)
+        self.save_server_candidate(candidate)
             .map_err(|error| error.to_string())?;
         self.app.server_public_key_display = self
             .config
@@ -626,32 +646,34 @@ impl ProductionApp {
         Ok(removed_permissions)
     }
 
-    fn reconcile_client_permissions(&mut self) -> usize {
-        let valid_host_ids = self
-            .app
-            .hosts
-            .iter()
-            .map(|host| host.id.trim().to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        let removed_permissions =
-            reconcile_client_host_permissions(&mut self.client_acl, &valid_host_ids);
-        for view in &mut self.app.clients {
-            if let Some(client) = self
-                .client_acl
-                .iter()
-                .find(|client| client.client_id == view.client_id)
-            {
-                view.access = if !self.app.hosts.is_empty()
-                    && client.allowed_hosts.len() == self.app.hosts.len()
-                {
-                    format!("全部 {} 台主机", client.allowed_hosts.len())
-                } else {
-                    format!("{} 台主机", client.allowed_hosts.len())
-                };
-            }
+    fn save_server_candidate(
+        &mut self,
+        mut candidate: config::AppConfig,
+    ) -> Result<(), config::ConfigError> {
+        let result = candidate.save(&self.config_path);
+        self.finish_server_save(candidate, result)
+    }
+
+    fn finish_server_save(
+        &mut self,
+        candidate: config::AppConfig,
+        result: Result<(), config::ConfigError>,
+    ) -> Result<(), config::ConfigError> {
+        // Rename is the visibility boundary, even if the subsequent directory
+        // sync cannot confirm crash durability. Never retain a stale ACL then.
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| error.replacement_committed())
+        {
+            self.config = candidate;
+            self.client_acl = self.config.security.allowed_clients.clone();
+            self.load_view_from_config();
         }
-        self.config.security.allowed_clients = self.client_acl.clone();
-        removed_permissions
+        if result.is_err() {
+            self.app.config_status = "保存失败".into();
+        }
+        result
     }
 
     fn persist_server_with_notice(&mut self) -> bool {
@@ -672,6 +694,8 @@ impl ProductionApp {
                 true
             }
             Err(error) => {
+                self.load_view_from_config();
+                self.app.config_status = "保存失败".into();
                 self.app.notify(format!("保存失败: {error}"));
                 false
             }
@@ -709,7 +733,13 @@ impl ProductionApp {
         match client::load_runtime(&self.config_path, None, None) {
             Ok(runtime) => {
                 self.shutdown_client();
-                self.client = Some(client::spawn_client(runtime));
+                self.client = match client::spawn_client(runtime) {
+                    Ok(handle) => Some(handle),
+                    Err(error) => {
+                        self.app.notify(format!("无法启动客户端任务: {error}"));
+                        return;
+                    }
+                };
                 self.config = settings;
                 self.catalog_version = 0;
                 self.app.hosts.clear();
@@ -786,7 +816,7 @@ impl ProductionApp {
             boot_nonce,
             catalog_version: self.catalog_version,
             targets,
-            accepted: HashSet::new(),
+            progress: crate::wake::Progress::new(now),
             attempt: 1,
             ticket: None,
             receipt: false,
@@ -797,7 +827,6 @@ impl ProductionApp {
     }
 
     fn issue_credential(&mut self) {
-        self.reconcile_client_permissions();
         let label = self.app.issue_label_input.value().trim().to_owned();
         let output = self.app.issue_output_input.value().trim().to_owned();
         let allowed_hosts = self
@@ -831,13 +860,10 @@ impl ProductionApp {
             }
             let mut candidate = self.config.clone();
             candidate.security.allowed_clients[index].allowed_hosts = allowed_hosts;
-            if let Err(error) = candidate.save(&self.config_path) {
+            if let Err(error) = self.save_server_candidate(candidate) {
                 self.app.notify(format!("无法保存客户端权限: {error}"));
                 return;
             }
-            self.config = candidate;
-            self.client_acl = self.config.security.allowed_clients.clone();
-            self.load_view_from_config();
             self.app.credential_index = index.min(self.app.clients.len().saturating_sub(1));
             self.app.screen = Screen::Credentials;
             self.app
@@ -849,11 +875,12 @@ impl ProductionApp {
                 .notify(format!("客户端凭据最多允许 {MAX_CLIENTS} 份"));
             return;
         }
-        if let Err(error) = self.config.ensure_server_identity_material() {
+        let mut candidate = self.config.clone();
+        if let Err(error) = candidate.ensure_server_identity_material() {
             self.app.notify(format!("服务端身份无效: {error}"));
             return;
         }
-        self.config.ensure_secret();
+        candidate.ensure_secret();
         let (static_private_key, static_public_key) = config::generate_identity_pair();
         let public_key = match config::decode_key(&static_public_key) {
             Ok(value) => value,
@@ -884,17 +911,16 @@ impl ProductionApp {
             version: 1,
             client_id: client_id.clone(),
             device_label: label.clone(),
-            shared_secret: self.config.security.shared_secret.clone(),
+            shared_secret: candidate.security.shared_secret.clone(),
             static_private_key,
             static_public_key: static_public_key.clone(),
-            pinned_server_static_key: self.config.security.server_static_public_key.clone(),
-            custom_headers: self.config.security.custom_headers.clone(),
+            pinned_server_static_key: candidate.security.server_static_public_key.clone(),
+            custom_headers: candidate.security.custom_headers.clone(),
         };
         if let Err(error) = client::save_credential_bundle(&output_path, &bundle) {
             self.app.notify(format!("无法写入凭据: {error}"));
             return;
         }
-        let mut candidate = self.config.clone();
         candidate
             .security
             .allowed_clients
@@ -905,10 +931,18 @@ impl ProductionApp {
                 allowed_hosts,
                 issued_credential_file: output_path.to_string_lossy().into_owned(),
             });
-        if let Err(error) = candidate.save(&self.config_path) {
-            let rollback = std::fs::remove_file(&output_path);
+        if let Err(error) = self.save_server_candidate(candidate) {
+            if error.replacement_committed() {
+                self.app.notify(format!(
+                    "服务端 ACL 已写入但持久化未确认，凭据文件已保留，请重新保存: {error}"
+                ));
+                self.app.screen = Screen::Credentials;
+                return;
+            }
+            let rollback =
+                client::remove_issued_credential_bundle(&output_path, &bundle.static_public_key);
             self.app.notify(match rollback {
-                Ok(()) => format!("无法保存服务端 ACL，已撤回凭据文件: {error}"),
+                Ok(_) => format!("无法保存服务端 ACL，已撤回凭据文件: {error}"),
                 Err(cleanup_error) => format!(
                     "无法保存服务端 ACL: {error}；凭据回滚也失败，请立即删除 {}: {cleanup_error}",
                     output_path.display()
@@ -916,9 +950,6 @@ impl ProductionApp {
             });
             return;
         }
-        self.config = candidate;
-        self.client_acl = self.config.security.allowed_clients.clone();
-        self.load_view_from_config();
         self.app.credential_index = self.app.clients.len().saturating_sub(1);
         self.app.screen = Screen::Credentials;
         self.app
@@ -960,13 +991,12 @@ impl ProductionApp {
 
     fn start_server(&mut self) {
         self.refresh_server_state();
+        if !self.persist_server_with_notice() {
+            return;
+        }
         if self.server_started {
             self.app.screen = Screen::ServerRunning;
             self.app.notify("服务已在后台运行".into());
-            return;
-        }
-        if let Err(error) = self.sync_server_from_view() {
-            self.app.notify(format!("启动前保存失败: {error}"));
             return;
         }
         let path = self.config_path.clone();
@@ -1034,24 +1064,31 @@ impl ProductionApp {
     }
 
     fn stop_server(&mut self) {
+        if self.server_thread.is_none() && self.server_shutdown.is_none() {
+            return;
+        }
         if let Some(shutdown) = self.server_shutdown.take() {
             shutdown.store(true, Ordering::Release);
         }
+        let mut failure = None;
         if let Some(thread) = self.server_thread.take() {
             match thread.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => self.app.notify(format!("服务停止时返回错误: {error}")),
-                Err(_) => self
-                    .app
-                    .notify("服务线程发生 panic，详细信息已写入日志".into()),
+                Ok(Err(error)) => failure = Some(format!("服务停止时返回错误: {error}")),
+                Err(_) => failure = Some("服务线程发生 panic，详细信息已写入日志".into()),
             }
         }
         self.server_started = false;
-        self.app.server_phase = ServerPhase::Stopped;
+        self.app.server_phase = if failure.is_some() {
+            ServerPhase::Failed
+        } else {
+            ServerPhase::Stopped
+        };
         self.app.active_connections = 0;
         self.server_metrics = server::ServerMetrics::default();
         self.app.screen = Screen::ServerHome;
-        self.app.notify("服务已停止".into());
+        self.app
+            .notify(failure.unwrap_or_else(|| "服务已停止".into()));
     }
 
     fn build_deployment_info(&mut self) {
@@ -1062,11 +1099,7 @@ impl ProductionApp {
         let Some(receiver) = self.runtime_log_rx.as_ref() else {
             return;
         };
-        let mut messages = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            messages.push(message);
-        }
-        for message in messages {
+        for message in receiver.drain() {
             let (level, text) = message.split_once(' ').map_or(
                 (LogLevel::Info, message.as_str()),
                 |(level, text)| {
@@ -1094,13 +1127,11 @@ impl ProductionApp {
     }
 
     fn drain_client_events(&mut self) {
-        loop {
-            let event = self
-                .client
-                .as_ref()
-                .and_then(|handle| handle.events.try_recv().ok());
-            let Some(event) = event else {
-                break;
+        while let Some(handle) = self.client.as_ref() {
+            let event = match handle.events.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => client::ClientEvent::Disconnected,
             };
             self.apply_client_event(event);
         }
@@ -1200,24 +1231,26 @@ impl ProductionApp {
                 let Some(wake) = self.wake.as_mut() else {
                     return;
                 };
-                if wake.operation_id != operation_id || wake.attempt != attempt {
+                if wake.operation_id != operation_id || wake.attempt != attempt || wake.finished {
                     return;
                 }
                 wake.receipt = true;
                 wake.ticket = Some(retry_ticket);
-                wake.accepted = results
-                    .iter()
-                    .filter(|result| result.accepted)
-                    .map(|result| result.host_id.clone())
-                    .collect();
                 let now = Instant::now();
-                wake.deadline = now + client::WAKE_WAIT_TIMEOUT;
+                wake.progress.receive(&results, now);
+                wake.deadline = wake.progress.deadline;
                 self.app.wake_receipt = true;
                 self.app.wake_phase = WakePhase::Waiting;
                 self.app.wake_deadline = wake.deadline;
-                self.app.wake_started_at = now;
+                self.app.wake_started_at = wake.progress.started_at.unwrap_or(now);
+                self.app.wake_rejected = wake
+                    .targets
+                    .iter()
+                    .map(|target| !wake.progress.accepted.contains(target))
+                    .collect();
                 for result in results {
                     if result.accepted
+                        && !wake.progress.online.contains(&result.host_id)
                         && let Some(host) = self
                             .app
                             .hosts
@@ -1227,10 +1260,10 @@ impl ProductionApp {
                         host.state = HostState::Waking;
                     }
                 }
-                if wake.accepted.is_empty() {
+                if wake.progress.accepted.is_empty() {
+                    wake.finished = true;
+                    self.app.wake_phase = WakePhase::Failed;
                     self.app.notify("服务端拒绝了全部目标".into());
-                    self.app.screen = Screen::ClientHosts;
-                    self.wake = None;
                 }
             }
             client::ClientEvent::TargetOnline {
@@ -1239,12 +1272,12 @@ impl ProductionApp {
                 host_id,
                 ..
             } => {
-                let Some(wake) = self.wake.as_ref() else {
+                let Some(wake) = self.wake.as_mut() else {
                     return;
                 };
                 if wake.operation_id != operation_id
                     || wake.attempt != attempt
-                    || !wake.accepted.contains(&host_id)
+                    || !wake.progress.observe(&host_id)
                 {
                     return;
                 }
@@ -1256,18 +1289,16 @@ impl ProductionApp {
                 if let Some(host) = self.app.hosts.iter_mut().find(|host| host.id == host_id) {
                     host.state = HostState::Online;
                 }
-                if wake.accepted.iter().all(|target| {
-                    wake.targets
-                        .iter()
-                        .position(|item| item == target)
-                        .is_some_and(|index| {
-                            self.app.wake_online.get(index).copied().unwrap_or(false)
-                        })
-                }) {
-                    self.app.wake_phase = WakePhase::Complete;
-                    if let Some(wake) = self.wake.as_mut() {
+                match wake.progress.outcome(&wake.targets) {
+                    crate::wake::Outcome::Complete => {
+                        self.app.wake_phase = WakePhase::Complete;
                         wake.finished = true;
                     }
+                    crate::wake::Outcome::Partial => {
+                        self.app.wake_phase = WakePhase::Partial;
+                        wake.finished = true;
+                    }
+                    crate::wake::Outcome::Rejected | crate::wake::Outcome::Waiting => {}
                 }
             }
             client::ClientEvent::Error(error) => self.app.notify(error),
@@ -1282,8 +1313,11 @@ impl ProductionApp {
                 self.app.connection_phase = ClientConnectionPhase::Disconnected;
                 self.app.connection_display = "连接已断开".into();
                 self.app.connection_error_code = Some("TRANSPORT".into());
-                self.app.connection_error_message =
-                    Some("安全连接已断开，当前唤醒状态未完成".into());
+                self.app.connection_error_message = Some(if wake_in_progress {
+                    "安全连接已断开，当前唤醒状态未完成".into()
+                } else {
+                    "安全连接已断开".into()
+                });
                 self.app.connection_retry_at = None;
                 if wake_in_progress {
                     self.app
@@ -1296,6 +1330,9 @@ impl ProductionApp {
     }
 
     fn tick_wake(&mut self) {
+        if self.expire_wake_recovery() {
+            return;
+        }
         let Some(wake) = self.wake.as_mut() else {
             return;
         };
@@ -1345,7 +1382,7 @@ impl ProductionApp {
                 }
                 wake.attempt = 2;
                 wake.receipt = false;
-                wake.accepted.clear();
+                wake.progress = crate::wake::Progress::new(now);
                 wake.receipt_deadline = now + client::RECEIPT_TIMEOUT;
                 wake.deadline = now + client::WAKE_WAIT_TIMEOUT;
                 self.app.wake_attempt = 2;
@@ -1354,6 +1391,7 @@ impl ProductionApp {
                 self.app.wake_started_at = now;
                 self.app.wake_deadline = wake.deadline;
                 self.app.wake_online.fill(false);
+                self.app.wake_rejected.fill(false);
                 self.app
                     .notify("一分钟未全部上线，正在申请一次授权重发".into());
             } else {
@@ -1364,7 +1402,24 @@ impl ProductionApp {
         }
     }
 
+    fn expire_wake_recovery(&mut self) -> bool {
+        let Some(wake) = self.wake.as_mut().filter(|wake| !wake.finished) else {
+            return false;
+        };
+        if wake.progress.can_recover(Instant::now()) {
+            return false;
+        }
+        wake.finished = true;
+        self.app.wake_phase = WakePhase::Failed;
+        self.app
+            .notify("唤醒恢复窗口已过期，请返回后重新发起操作".into());
+        true
+    }
+
     fn resume_wake_after_reconnect(&mut self) {
+        if self.expire_wake_recovery() {
+            return;
+        }
         let Some(wake) = self.wake.as_ref().filter(|wake| !wake.finished) else {
             return;
         };
@@ -1446,14 +1501,11 @@ impl ProductionApp {
     }
 
     fn shutdown_client(&mut self) {
-        if let Some(handle) = self.client.take()
-            && handle
-                .commands
-                .send(client::ClientCommand::Shutdown)
-                .is_err()
-            && !self.app.should_quit
+        if let Some(mut handle) = self.client.take()
+            && let Err(error) = handle.shutdown()
         {
-            self.app.notify("客户端连接任务已提前退出".into());
+            logging::log(logging::Level::Error, error.to_string());
+            self.app.notify(format!("客户端退出失败: {error}"));
         }
         self.wake = None;
         self.app.connection_phase = ClientConnectionPhase::Disconnected;
@@ -1467,6 +1519,12 @@ impl ProductionApp {
     fn shutdown(&mut self) {
         self.shutdown_client();
         self.stop_server();
+    }
+}
+
+impl Drop for ProductionApp {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1520,7 +1578,11 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
             .unwrap_or_else(|_| "RemoteOpenPower.exe".into());
         vec![
             "Windows 前台启动指令".into(),
-            format!("\"{executable}\" --server --config \"{config}\""),
+            format!(
+                "& {} --server --config {}",
+                powershell_quote(&executable),
+                powershell_quote(&config)
+            ),
             "配置与 PSK 保存在 TOML，不放入命令行或日志。".into(),
         ]
     }
@@ -1563,7 +1625,7 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
             "ProtectSystem=strict".into(),
             "ProtectHome=true".into(),
             "PrivateTmp=true".into(),
-            "RestrictAddressFamilies=AF_INET AF_INET6".into(),
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK".into(),
             "TasksMax=96".into(),
             "LimitNOFILE=256".into(),
             "LimitCORE=0".into(),
@@ -1590,6 +1652,11 @@ fn deployment_lines(config_path: &Path) -> Vec<String> {
     }
 }
 
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 #[cfg(target_os = "linux")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
@@ -1597,8 +1664,10 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod production_tests {
+    include!("tui_tests.rs");
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::mpsc;
 
     fn test_capabilities() -> TerminalCapabilities {
         TerminalCapabilities {
@@ -1611,11 +1680,8 @@ mod production_tests {
 
     #[test]
     fn production_view_uses_real_config_defaults_without_fake_rows() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-tui-{}-missing.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         assert!(state.app.hosts.is_empty());
         assert!(state.app.clients.is_empty());
@@ -1644,16 +1710,22 @@ mod production_tests {
         assert!(joined.contains(path.to_string_lossy().as_ref()));
         assert!(!joined.contains("shared_secret"));
         assert!(!joined.contains("static_private_key"));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| { line == "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK" })
+            );
+            assert!(lines.iter().any(|line| line == "CapabilityBoundingSet="));
+            assert!(lines.iter().any(|line| line == "NoNewPrivileges=true"));
+        }
     }
 
     #[test]
     fn revoke_confirmation_enter_does_not_open_the_credential_editor() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-revoke-modal-{}-{}.toml",
-            std::process::id(),
-            client::now_ms()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         state.app.screen = Screen::Credentials;
         state.app.clients.push(ClientRow {
@@ -1673,19 +1745,13 @@ mod production_tests {
         assert_eq!(state.app.modal, None);
         assert!(state.app.clients.is_empty());
         assert_eq!(state.app.issue_edit_index, None);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn revocation_saves_acl_and_deletes_the_server_side_credential_copy() {
-        let directory = std::env::temp_dir().join(format!(
-            "remote-open-power-revoke-issued-{}-{}",
-            std::process::id(),
-            client::now_ms()
-        ));
-        std::fs::create_dir_all(&directory).expect("create revoke test directory");
-        let config_path = directory.join("remote-open-power.toml");
-        let credential_path = directory.join("portable.credential.toml");
+        let directory = crate::test_support::TestDirectory::new();
+        let config_path = directory.0.join("remote-open-power.toml");
+        let credential_path = directory.0.join("portable.credential.toml");
         let mut state =
             ProductionApp::new(&config_path, test_capabilities()).expect("production state");
         state.app.hosts.push(HostRow {
@@ -1720,8 +1786,6 @@ mod production_tests {
         assert!(state.client_acl.is_empty());
         let saved = config::AppConfig::load(&config_path).expect("load revoked config");
         assert!(saved.security.allowed_clients.is_empty());
-        std::fs::remove_file(&config_path).expect("remove revoke test config");
-        std::fs::remove_dir(&directory).expect("remove revoke test directory");
     }
 
     #[test]
@@ -1768,12 +1832,8 @@ mod production_tests {
 
     #[test]
     fn server_save_prunes_unknown_host_permissions_instead_of_failing() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-stale-acl-{}-{}.toml",
-            std::process::id(),
-            client::now_ms()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         state.app.hosts.push(HostRow {
             id: "current-pc".to_owned(),
@@ -1809,7 +1869,6 @@ mod production_tests {
                 .is_empty()
         );
         assert_eq!(state.app.clients[0].access, "0 台主机");
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1956,11 +2015,8 @@ mod production_tests {
 
     #[test]
     fn interrupted_wake_is_preserved_and_resubmitted_after_reconnect() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-wake-reconnect-{}-missing.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         let operation_id = [4; 16];
         state.app.screen = Screen::Wake;
@@ -1979,7 +2035,13 @@ mod production_tests {
             boot_nonce: [5; 16],
             catalog_version: 9,
             targets: vec!["lab-pc".into()],
-            accepted: HashSet::from(["lab-pc".into()]),
+            progress: crate::wake::Progress {
+                created_at: Instant::now(),
+                accepted: HashSet::from(["lab-pc".into()]),
+                online: HashSet::new(),
+                started_at: Some(Instant::now()),
+                deadline: Instant::now() + Duration::from_secs(50),
+            },
             attempt: 1,
             ticket: Some([6; 32]),
             receipt: true,
@@ -1989,7 +2051,7 @@ mod production_tests {
         });
         let (commands, command_rx) = mpsc::channel();
         let (_event_tx, events) = mpsc::sync_channel(1);
-        state.client = Some(client::ClientHandle { commands, events });
+        state.client = Some(client::ClientHandle::from_channels(commands, events));
 
         state.apply_client_event(client::ClientEvent::ConnectionFailed {
             attempt: 1,
@@ -2025,11 +2087,8 @@ mod production_tests {
 
     #[test]
     fn disconnected_wake_does_not_advance_to_attempt_two() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-wake-paused-{}-missing.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         state.app.screen = Screen::Wake;
         state.app.connection_phase = ClientConnectionPhase::RetryWaiting;
@@ -2038,7 +2097,13 @@ mod production_tests {
             boot_nonce: [8; 16],
             catalog_version: 1,
             targets: vec!["lab-pc".into()],
-            accepted: HashSet::from(["lab-pc".into()]),
+            progress: crate::wake::Progress {
+                created_at: Instant::now() - Duration::from_secs(60),
+                accepted: HashSet::from(["lab-pc".into()]),
+                online: HashSet::new(),
+                started_at: Some(Instant::now() - Duration::from_secs(60)),
+                deadline: Instant::now(),
+            },
             attempt: 1,
             ticket: Some([9; 32]),
             receipt: true,
@@ -2055,11 +2120,8 @@ mod production_tests {
 
     #[test]
     fn reconnect_discards_the_previous_authenticated_catalog() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-reconnect-{}-missing.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         state.catalog_version = 42;
         state.app.hosts.push(HostRow {
@@ -2084,11 +2146,8 @@ mod production_tests {
 
     #[test]
     fn rejected_wake_receipt_does_not_invent_offline_state() {
-        let path = std::env::temp_dir().join(format!(
-            "remote-open-power-rejected-{}-missing.toml",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
         let mut state = ProductionApp::new(&path, test_capabilities()).expect("production state");
         let operation_id = [1; 16];
         state.app.hosts.push(HostRow {
@@ -2105,7 +2164,7 @@ mod production_tests {
             boot_nonce: [2; 16],
             catalog_version: 1,
             targets: vec!["lab-pc".into()],
-            accepted: HashSet::new(),
+            progress: crate::wake::Progress::new(Instant::now()),
             attempt: 1,
             ticket: None,
             receipt: false,

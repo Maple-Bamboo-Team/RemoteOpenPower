@@ -88,10 +88,19 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("invalid TOML in {path}: {source}")]
+    #[cfg(any(unix, test))]
+    #[error(
+        "config {path} was replaced, but directory synchronization failed; durability is uncertain: {source}"
+    )]
+    Durability {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("invalid TOML in {path} at line {line}, byte column {column}")]
     Parse {
         path: PathBuf,
-        source: Box<toml::de::Error>,
+        line: usize,
+        column: usize,
     },
     #[error("invalid configuration: {0}")]
     Invalid(String),
@@ -103,6 +112,17 @@ pub enum ConfigError {
         write: Box<ConfigError>,
         cleanup: std::io::Error,
     },
+}
+
+impl ConfigError {
+    pub(crate) fn replacement_committed(&self) -> bool {
+        match self {
+            #[cfg(any(unix, test))]
+            Self::Durability { .. } => true,
+            Self::Cleanup { write, .. } => write.replacement_committed(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,9 +462,19 @@ impl AppConfig {
         else {
             return Ok(Self::default());
         };
-        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.clone(),
-            source: Box::new(source),
+        let config: Self = toml::from_str(&text).map_err(|source: toml::de::Error| {
+            // Parser errors can retain the entire secret-bearing input and
+            // interpolate values into their message. Keep only its location.
+            let offset = source.span().map_or(0, |span| span.start).min(text.len());
+            let prefix = &text.as_bytes()[..offset];
+            ConfigError::Parse {
+                path: path.clone(),
+                line: prefix.iter().filter(|byte| **byte == b'\n').count() + 1,
+                column: prefix
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(offset + 1, |last| offset - last),
+            }
         })?;
         Ok(config)
     }
@@ -733,24 +763,49 @@ impl AppConfig {
 /// checks are performed on that handle, so an attacker cannot replace the
 /// directory entry between metadata validation and the actual read.
 pub(crate) fn read_private_text(path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
+    open_private_file(path, max_bytes, false)?
+        .map(|mut file| read_private_handle(&mut file, max_bytes))
+        .transpose()
+}
+
+pub(crate) fn open_private_file(
+    path: &Path,
+    max_bytes: u64,
+    delete: bool,
+) -> io::Result<Option<fs::File>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        if delete {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unix removal requires a captured directory entry",
+            ));
+        }
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::GENERIC_READ,
+            Storage::FileSystem::{DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ},
+        };
 
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options
-            .share_mode(0)
+            .access_mode(GENERIC_READ | if delete { DELETE } else { 0 })
+            .share_mode(if delete {
+                FILE_SHARE_READ
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_DELETE
+            })
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
 
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -793,10 +848,15 @@ pub(crate) fn read_private_text(path: &Path, max_bytes: u64) -> io::Result<Optio
                 "private file cannot be a reparse point",
             ));
         }
+        crate::private_file::validate_windows(&file)?;
     }
 
+    Ok(Some(file))
+}
+
+pub(crate) fn read_private_handle(file: &mut fs::File, max_bytes: u64) -> io::Result<String> {
     let mut text = String::new();
-    Read::by_ref(&mut file)
+    Read::by_ref(file)
         .take(max_bytes.saturating_add(1))
         .read_to_string(&mut text)?;
     if text.len() as u64 > max_bytes {
@@ -805,7 +865,7 @@ pub(crate) fn read_private_text(path: &Path, max_bytes: u64) -> io::Result<Optio
             "private file exceeds its size limit",
         ));
     }
-    Ok(Some(text))
+    Ok(text)
 }
 
 #[cfg(any(unix, test))]
@@ -910,6 +970,14 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
 
     #[cfg(unix)]
     let replacement_metadata = unix_replacement_metadata(path)?;
+    #[cfg(unix)]
+    let directory = OpenOptions::new()
+        .read(true)
+        .open(&parent)
+        .map_err(|source| ConfigError::Write {
+            path: parent.clone(),
+            source,
+        })?;
 
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -984,25 +1052,7 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
         })?;
         drop(file);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&temp_path)
-                .map_err(|source| ConfigError::Write {
-                    path: temp_path.clone(),
-                    source,
-                })?
-                .permissions();
-            permissions.set_mode(replacement_metadata.map_or(0o600, |metadata| metadata.mode));
-            fs::set_permissions(&temp_path, permissions).map_err(|source| ConfigError::Write {
-                path: temp_path.clone(),
-                source,
-            })?;
-        }
-
-        // Reject a path alias before replacement. The Windows branch below
-        // replaces atomically with write-through instead of deleting the old
-        // file first.
+        // Reject a path alias before atomically replacing the directory entry.
         #[cfg(windows)]
         if path.exists() {
             let current = fs::symlink_metadata(path).map_err(|source| ConfigError::Write {
@@ -1015,29 +1065,19 @@ pub(crate) fn write_private_toml(path: &Path, text: &str) -> Result<(), ConfigEr
                 ));
             }
         }
-        #[cfg(windows)]
-        move_file_replace(&temp_path, path).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        #[cfg(not(windows))]
+        // std handles replacement while FILE_SHARE_DELETE readers retain the old file.
         fs::rename(&temp_path, path).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source,
         })?;
         #[cfg(unix)]
         {
-            let directory = OpenOptions::new()
-                .read(true)
-                .open(&parent)
-                .map_err(|source| ConfigError::Write {
-                    path: parent.clone(),
+            directory
+                .sync_all()
+                .map_err(|source| ConfigError::Durability {
+                    path: path.to_path_buf(),
                     source,
                 })?;
-            directory.sync_all().map_err(|source| ConfigError::Write {
-                path: parent.clone(),
-                source,
-            })?;
         }
         Ok(())
     })();
@@ -1147,36 +1187,6 @@ fn create_private_windows_file(path: &Path) -> io::Result<fs::File> {
         return Err(error);
     }
     Ok(unsafe { fs::File::from_raw_handle(handle.cast()) })
-}
-
-#[cfg(windows)]
-fn move_file_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 pub fn validate_header(key: &str, value: &str) -> Result<(), ConfigError> {
@@ -1402,6 +1412,60 @@ fn validate_identity_pair(private: &str, public: &str, name: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_config_errors_never_include_secret_source() {
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
+        write_private_toml(&path, "[security]\nshared_secret = 'FAKE_SECRET_MARKER'\nserver_static_private_key = 'FAKE_PRIVATE_MARKER'\ninvalid = [\n").unwrap();
+        let error = AppConfig::load(&path).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse { .. }));
+        let report = format!("error={error}\ndebug={error:#?}");
+        assert!(!report.contains("FAKE_SECRET_MARKER"));
+        assert!(!report.contains("FAKE_PRIVATE_MARKER"));
+        assert!(report.contains("line"));
+    }
+
+    #[test]
+    fn private_reads_reject_hard_links() {
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
+        write_private_toml(&path, "private").unwrap();
+        fs::hard_link(&path, directory.0.join("alias.toml")).unwrap();
+        assert_eq!(
+            read_private_text(&path, 100).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_replacement_preserves_unix_owner_group_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("config.toml");
+        write_private_toml(&path, "original").unwrap();
+        let mode = if unsafe { libc::geteuid() } == 0 {
+            0o640
+        } else {
+            0o600
+        };
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        let original = fs::metadata(&path).unwrap();
+        write_private_toml(&path, "replacement").unwrap();
+        let saved = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (saved.uid(), saved.gid(), saved.mode() & 0o777),
+            (original.uid(), original.gid(), mode)
+        );
+        assert_eq!(
+            read_private_text(&path, 100).unwrap().unwrap(),
+            "replacement"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(write_private_toml(&path, "unsafe").is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "replacement");
+    }
 
     #[test]
     fn generated_secret_is_usable() {
