@@ -112,7 +112,7 @@ impl ProductionApp {
         match client::discover_credential_path(&config_path) {
             Ok(path) => {
                 app.credential_display = path.display().to_string();
-                app.credential_status = "已发现凭据文件，连接时将验证".into();
+                app.credential_status = "已发现凭据文件".into();
             }
             Err(client::ClientError::CredentialAmbiguous { .. }) => {
                 app.credential_display =
@@ -326,6 +326,11 @@ impl ProductionApp {
     fn handle_real_action(&mut self, key: KeyEvent) -> bool {
         let plain = key.modifiers.is_empty();
 
+        if plain && key.code == KeyCode::F(9) && self.app.screen == Screen::ClientConnect {
+            self.open_credential_repair();
+            return true;
+        }
+
         // Keep page switching available from every top-level server page and
         // attach persistence/deployment side effects to those transitions.
         if plain
@@ -400,6 +405,10 @@ impl ProductionApp {
                     && !self.app.clients.is_empty() =>
             {
                 self.open_credential_edit();
+                true
+            }
+            Screen::CredentialRepair if plain && key.code == KeyCode::Enter => {
+                self.repair_selected_credentials();
                 true
             }
             Screen::ClientConnect if plain && key.code == KeyCode::Enter => {
@@ -700,6 +709,80 @@ impl ProductionApp {
                 false
             }
         }
+    }
+
+    fn open_credential_repair(&mut self) {
+        match client::scan_repairable_credentials(&self.config_path) {
+            Ok(candidates) => {
+                self.app.repair_candidates = candidates;
+                self.app.repair_selected = vec![false; self.app.repair_candidates.len()];
+                self.app.credential_index = 0;
+                self.app.repair_mode = true;
+                self.app.screen = Screen::CredentialRepair;
+                self.app.notify(if self.app.repair_candidates.is_empty() {
+                    "未发现可安全修复的凭据文件".into()
+                } else {
+                    format!(
+                        "发现 {} 个可修复凭据，请用 Space 多选后按 Enter",
+                        self.app.repair_candidates.len()
+                    )
+                });
+            }
+            Err(error) => self.app.notify(format!("扫描凭据失败: {error}")),
+        }
+    }
+
+    fn refresh_credential_status(&mut self) {
+        match client::discover_credential_path(&self.config_path) {
+            Ok(path) => {
+                self.app.credential_display = path.display().to_string();
+                self.app.credential_status = "已发现凭据文件".into();
+            }
+            Err(client::ClientError::CredentialAmbiguous { .. }) => {
+                self.app.credential_display =
+                    client::credential_path(&self.config_path).display().to_string();
+                self.app.credential_status = "发现多个凭据文件，连接前必须清理".into();
+            }
+            Err(client::ClientError::EnrollmentRequired { .. }) => {
+                self.app.credential_display =
+                    client::credential_path(&self.config_path).display().to_string();
+                self.app.credential_status = "未发现凭据文件".into();
+            }
+            Err(error) => {
+                self.app.credential_display =
+                    client::credential_path(&self.config_path).display().to_string();
+                self.app.credential_status = format!("凭据检查失败: {error}");
+            }
+        }
+    }
+
+    fn repair_selected_credentials(&mut self) {
+        let selected = self
+            .app
+            .repair_candidates
+            .iter()
+            .zip(&self.app.repair_selected)
+            .filter_map(|(candidate, selected)| selected.then_some(candidate.path.clone()))
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            self.app.notify("请先用 Space 选择至少一个凭据文件".into());
+            return;
+        }
+        let mut repaired = 0;
+        let mut failures = Vec::new();
+        for path in selected {
+            match client::repair_credential_bundle(&path) {
+                Ok(()) => repaired += 1,
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            }
+        }
+        self.app.close_credential_repair();
+        self.refresh_credential_status();
+        self.app.notify(if failures.is_empty() {
+            format!("已安全修复 {repaired} 个凭据文件")
+        } else {
+            format!("已修复 {repaired} 个凭据；失败 {} 个", failures.len())
+        });
     }
 
     fn connect_client(&mut self) {

@@ -137,6 +137,9 @@ enum Screen {
     CredentialIssue,
     ServerRunning,
     ClientConnect,
+    /// Client-only: scan and repair private-permission credential bundles.
+    /// Entered solely from ClientConnect via F9; exits only back to ClientConnect.
+    CredentialRepair,
     ClientHosts,
     Wake,
     SaveExit,
@@ -404,6 +407,10 @@ struct App {
     server_public_key_display: String,
     deployment_summary: String,
     deployment_lines: Vec<String>,
+    deployment_scroll: usize,
+    repair_mode: bool,
+    repair_candidates: Vec<crate::client::CredentialRepairCandidate>,
+    repair_selected: Vec<bool>,
 }
 
 impl App {
@@ -480,6 +487,10 @@ impl App {
             server_public_key_display: String::new(),
             deployment_summary: String::new(),
             deployment_lines: Vec::new(),
+            deployment_scroll: 0,
+            repair_mode: false,
+            repair_candidates: Vec::new(),
+            repair_selected: Vec::new(),
         }
     }
 
@@ -497,6 +508,10 @@ impl App {
             } else if self.modal.is_none() {
                 self.modal = Some(Modal::Help);
             }
+            return;
+        }
+
+        if key.code == KeyCode::F(9) && self.modal.is_none() {
             return;
         }
 
@@ -519,6 +534,7 @@ impl App {
             Screen::CredentialIssue => self.handle_credential_issue(key),
             Screen::ServerRunning => self.handle_server_running(key),
             Screen::ClientConnect => self.handle_client_connect(key),
+            Screen::CredentialRepair => self.handle_credential_repair(key),
             Screen::ClientHosts => self.handle_client_hosts(key),
             Screen::Wake => self.handle_wake(key),
             Screen::SaveExit => self.handle_save_exit(key),
@@ -1085,6 +1101,36 @@ impl App {
         }
     }
 
+    fn handle_credential_repair(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.credential_index = self.credential_index.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.credential_index = (self.credential_index + 1)
+                    .min(self.repair_candidates.len().saturating_sub(1))
+            }
+            KeyCode::Char(' ') if !self.repair_candidates.is_empty() => {
+                self.repair_selected[self.credential_index] =
+                    !self.repair_selected[self.credential_index];
+            }
+            KeyCode::Char('a') if !self.repair_candidates.is_empty() => {
+                let all = self.repair_selected.iter().all(|selected| *selected);
+                self.repair_selected.fill(!all);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.close_credential_repair(),
+            _ => {}
+        }
+    }
+
+    fn close_credential_repair(&mut self) {
+        self.repair_mode = false;
+        self.repair_candidates.clear();
+        self.repair_selected.clear();
+        self.credential_index = 0;
+        self.screen = Screen::ClientConnect;
+    }
+
     fn handle_credentials(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1339,6 +1385,10 @@ impl App {
 
     fn handle_save_exit(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::PageUp => self.deployment_scroll = self.deployment_scroll.saturating_sub(6),
+            KeyCode::PageDown => self.deployment_scroll = self.deployment_scroll.saturating_add(6),
+            KeyCode::Home => self.deployment_scroll = 0,
+            KeyCode::End => self.deployment_scroll = usize::MAX,
             KeyCode::Char('s') | KeyCode::Enter => {
                 self.notify("配置已再次保存；部署命令未执行".into())
             }
@@ -1350,6 +1400,7 @@ impl App {
 
     fn open_deployment(&mut self) {
         self.screen = Screen::SaveExit;
+        self.deployment_scroll = 0;
         self.notify("配置已自动保存".into());
     }
 
@@ -1516,6 +1567,7 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::CredentialIssue => render_credential_issue(frame, app, body),
         Screen::ServerRunning => render_server_running(frame, app, body),
         Screen::ClientConnect => render_client_connect(frame, app, body),
+        Screen::CredentialRepair => render_credential_repair(frame, app, body),
         Screen::ClientHosts => render_client_hosts(frame, app, body),
         Screen::Wake => render_wake(frame, app, body),
         Screen::SaveExit => render_save_exit(frame, app, body),
@@ -1577,6 +1629,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Screen::CredentialIssue => "服务端 / 签发凭据",
         Screen::ServerRunning => "服务端 / 运行",
         Screen::ClientConnect => "客户端 / 连接",
+        Screen::CredentialRepair => "客户端 / 凭据修复",
         Screen::ClientHosts => "客户端 / 主机",
         Screen::Wake => "客户端 / 唤醒",
         Screen::SaveExit => "服务端 / 部署",
@@ -1643,13 +1696,14 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         (Screen::CredentialIssue, true) => "Tab区域  Space选择  Ctrl+S签发  Esc取消",
         (Screen::ServerRunning, true) => "1..5切页  PgUp/PgDn滚动  End跟随  c清屏  q停止",
-        (Screen::ClientConnect, true) => "Tab字段  Enter连接  Esc返回",
+        (Screen::ClientConnect, true) => "Tab字段  Enter连接  F9修复凭据  Esc返回",
+        (Screen::CredentialRepair, true) => "↑↓选择  Space勾选  a全选  Enter修复  Esc返回连接",
         (Screen::ClientHosts, true) if app.connection_phase != ClientConnectionPhase::Connected => {
             "自动重连中  Esc取消"
         }
         (Screen::ClientHosts, true) => "↑↓选择  Space勾选  a批选  r刷新  Enter唤醒  Esc断开",
         (Screen::Wake, true) => "等待回执/在线  Enter返回  Esc取消",
-        (Screen::SaveExit, true) => "1..5切页  s再次保存  q退出  Esc返回",
+        (Screen::SaveExit, true) => "1..5切页  PgUp/PgDn翻页  Home/End首尾  s保存  q退出",
         (Screen::ServerHome, false) => {
             "↑↓ 选择   a 添加   e/Enter 编辑   d 删除   2 设置   3 凭据   4 运行   5 部署   q 进入部署"
         }
@@ -1668,7 +1722,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (Screen::ServerRunning, false) => {
             "1..5 切页   PgUp/PgDn 滚动   End 跟随   c 清空视图   q/Esc 停止"
         }
-        (Screen::ClientConnect, false) => "Tab/↑↓ 切换字段   Enter 连接   Esc 返回",
+        (Screen::ClientConnect, false) => "Tab/↑↓ 切换字段   Enter 连接   F9 修复凭据   Esc 返回",
+        (Screen::CredentialRepair, false) => {
+            "↑↓ 选择   Space 勾选   a 全选/取消   Enter 安全修复   Esc 返回连接页"
+        }
         (Screen::ClientHosts, false)
             if app.connection_phase != ClientConnectionPhase::Connected =>
         {
@@ -1678,7 +1735,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "↑↓ 选择   Space 勾选   a 批量选择   r 刷新   Enter 唤醒   Esc 断开"
         }
         (Screen::Wake, false) => "等待服务端回执与在线状态   Enter 完成后返回   Esc 取消等待",
-        (Screen::SaveExit, false) => "1..5 切页   s/Enter 再次保存   q 退出   Esc 返回",
+        (Screen::SaveExit, false) => "1..5 切页   PgUp/PgDn 翻页   Home/End 首尾   s/Enter 保存   q 退出   Esc 返回",
     };
     let line = if let Some((message, _)) = &app.toast {
         Line::from(vec![
@@ -2267,6 +2324,32 @@ fn render_header_editor(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+fn render_credential_repair(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let rows = app.repair_candidates.iter().enumerate().map(|(index, candidate)| {
+        let mark = if app.repair_selected.get(index).copied().unwrap_or(false) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        Row::new([
+            format!("{mark} {}", candidate.path.display()),
+            candidate.device_label.clone(),
+        ])
+    });
+    let table = Table::new(rows, [Constraint::Percentage(72), Constraint::Min(20)])
+        .header(
+            Row::new(["待修复凭据文件", "标签"])
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
+                .bottom_margin(1),
+        )
+        .row_highlight_style(Style::default().fg(Color::Black).bg(CYAN))
+        .highlight_symbol("> ")
+        .block(panel(" 凭据安全修复 "));
+    let mut state = TableState::default()
+        .with_selected((!app.repair_candidates.is_empty()).then_some(app.credential_index));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_credentials(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let [nav, content] = Layout::horizontal([Constraint::Length(23), Constraint::Min(1)])
         .spacing(1)
@@ -2474,13 +2557,13 @@ fn render_server_running(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_client_connect(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let form = centered_rect(68, 12, area);
+    let form = centered_rect(68, 14, area);
     frame.render_widget(panel(" 安全连接 "), form);
     let inner = form.inner(Margin::new(3, 1));
     let [address, port, identity] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
-        Constraint::Length(4),
+        Constraint::Min(5),
     ])
     .areas(inner);
     render_input(
@@ -2507,6 +2590,7 @@ fn render_client_connect(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled(&app.credential_status, Style::default().fg(GREEN)),
             ]),
         ])
+        .wrap(Wrap { trim: false })
         .block(panel(" 客户端身份 ")),
         identity,
     );
@@ -2808,10 +2892,13 @@ fn render_save_exit(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .collect::<Vec<_>>(),
         )
     };
+    let max_scroll = deployment_text.lines.len().saturating_sub(deployment.height.saturating_sub(2) as usize);
+    let scroll = app.deployment_scroll.min(max_scroll);
     frame.render_widget(
         Paragraph::new(deployment_text)
             .block(panel(" 部署信息 "))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll as u16, 0)),
         deployment,
     );
 }
@@ -2963,7 +3050,15 @@ fn render_help_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Screen::ClientConnect => &[
             ("Tab / ↑ / ↓", "切换服务端地址和端口"),
             ("Enter", "校验地址和端口并连接"),
+            ("F9", "扫描并修复权限不安全的凭据文件"),
             ("Esc", "返回模式选择"),
+        ],
+        Screen::CredentialRepair => &[
+            ("↑ / ↓", "选择可修复凭据文件"),
+            ("Space", "勾选或取消当前文件"),
+            ("a", "全选或取消全选"),
+            ("Enter", "对已勾选文件执行安全修复"),
+            ("Esc / q", "返回客户端连接页"),
         ],
         Screen::ClientHosts => &[
             ("↑ / ↓", "选择主机"),
