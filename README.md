@@ -78,7 +78,14 @@ TUI 的“部署”页按当前平台输出启动方式。Linux 会生成 system
 
 Linux 服务配置采用 `root:remote-open-power 0640`，配置目录采用 `root:remote-open-power 0750`，日志目录由服务账户持有并采用 `0750`。程序会拒绝其他用户可读、组可写、世界可访问、硬链接或符号链接的私密文件；通过 TUI 重新保存已部署配置时会保留安全的服务属组读取权限。
 
-Windows 私密文件只允许当前用户、文件所有者、SYSTEM 和 Administrators 访问，并拒绝不可信所有者、重解析点和硬链接。复制凭据后若权限检查失败，先限制文件 ACL，不要关闭检查。普通只读句柄可并存；写入通过私密临时文件刷盘后原子替换。
+Windows 私密文件只允许当前用户、文件所有者、SYSTEM 和 Administrators 访问，并拒绝不可信所有者、重解析点和硬链接。Linux 签发的凭据复制到 Windows 后，目标目录可能自动继承 `Users` 或 `Authenticated Users` ACE；这会被客户端故意拒绝，报错会指出凭据文件读取/权限问题。请在 PowerShell 中先清除继承并授予当前用户只读权限（把路径替换为实际文件）：
+
+```powershell
+$credential = (Resolve-Path .\client.credential.toml).Path
+icacls $credential /inheritance:r /grant:r "$($env:USERNAME):(R)" /grant:r "SYSTEM:(F)" /grant:r "Administrators:(F)"
+```
+
+确认文件所有者是当前用户后再连接；不要关闭权限检查或把凭据放在宽权限共享目录。普通只读句柄可并存；写入通过私密临时文件刷盘后原子替换。
 
 主机和凭据修改在保存后热加载；修改主机目标会关闭旧会话并更新目录版本。监听地址或端口变化会停止旧监听，需重新启动服务（systemd 可按失败重启策略启动新配置）。停止完成意味着监听和连接工作线程均已退出。
 

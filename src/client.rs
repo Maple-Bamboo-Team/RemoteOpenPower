@@ -55,6 +55,12 @@ pub enum ClientError {
     EnrollmentRequired { path: PathBuf },
     #[error("invalid or unsafe client credential bundle")]
     Credential,
+    #[error("cannot read client credential bundle {path}: {source}")]
+    CredentialRead { path: PathBuf, source: io::Error },
+    #[error(
+        "client config {path} contains server credentials; create a separate client settings file and keep only the endpoint there"
+    )]
+    ServerConfigProvided { path: PathBuf },
     #[error(
         "multiple client credential bundles found in {directory}; keep one as {primary} or use a dedicated client directory"
     )]
@@ -86,6 +92,13 @@ pub struct CredentialBundle {
     pub custom_headers: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialRepairCandidate {
+    pub path: PathBuf,
+    pub client_id: String,
+    pub device_label: String,
+}
+
 impl std::fmt::Debug for CredentialBundle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -106,7 +119,7 @@ impl std::fmt::Debug for CredentialBundle {
 }
 
 impl CredentialBundle {
-    fn validate(&self) -> Result<Identity, ClientError> {
+    pub(crate) fn validate(&self) -> Result<Identity, ClientError> {
         if self.version != CREDENTIAL_VERSION {
             return Err(ClientError::Credential);
         }
@@ -136,6 +149,63 @@ impl CredentialBundle {
             .map_err(|_| ClientError::Credential)
             .map(|_| identity)
     }
+}
+
+/// Find valid credential bundles whose contents are readable but whose private
+/// file policy prevents normal loading. No file is modified during scanning.
+pub fn scan_repairable_credentials(
+    config_path: &Path,
+) -> Result<Vec<CredentialRepairCandidate>, ClientError> {
+    let parent = config_path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(parent).map_err(|source| ClientError::CredentialRead {
+        path: parent.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ClientError::CredentialRead {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".credential.toml"))
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(bundle) = toml::from_str::<CredentialBundle>(&text) else {
+            continue;
+        };
+        if bundle.validate().is_err() || load_credential_bundle(&path).is_ok() {
+            continue;
+        }
+        candidates.push(CredentialRepairCandidate {
+            path,
+            client_id: bundle.client_id,
+            device_label: bundle.device_label,
+        });
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(candidates)
+}
+
+/// Validate the complete bundle before atomically replacing its file with a
+/// newly created private file. The original remains untouched on failure.
+pub fn repair_credential_bundle(path: &Path) -> Result<(), ClientError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ClientError::CredentialRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let bundle: CredentialBundle = toml::from_str(&text).map_err(|_| ClientError::Credential)?;
+    bundle.validate()?;
+    save_credential_bundle(path, &bundle)
 }
 
 /// Runtime-only material.  Keep this separate from `ClientConfig` so the CLI
@@ -229,8 +299,13 @@ pub fn discover_credential_path(config_path: &Path) -> Result<PathBuf, ClientErr
 }
 
 fn load_credential_bundle(path: &Path) -> Result<Option<CredentialBundle>, ClientError> {
-    let Some(text) = crate::config::read_private_text(path, MAX_CREDENTIAL_BYTES)
-        .map_err(|_| ClientError::Credential)?
+    let Some(text) =
+        crate::config::read_private_text(path, MAX_CREDENTIAL_BYTES).map_err(|source| {
+            ClientError::CredentialRead {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?
     else {
         return Ok(None);
     };
@@ -1354,7 +1429,9 @@ pub fn load_runtime(
     // server TOML is rejected rather than silently converted, so an operator
     // cannot accidentally deploy the same signing material in both roles.
     if !config.security.server_static_private_key.trim().is_empty() {
-        return Err(ClientError::Credential);
+        return Err(ClientError::ServerConfigProvided {
+            path: path.to_path_buf(),
+        });
     }
     // The server public key in the settings file is not a client credential;
     // the pinned key comes from the separately provisioned bundle.  Clear all
@@ -1469,6 +1546,60 @@ mod tests {
             runtime.device_label.as_deref(),
             Some("original-windows-name")
         );
+    }
+
+    #[test]
+    fn copied_credential_requires_private_permissions_before_runtime_load() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = crate::test_support::TestDirectory::new();
+        let path = directory.0.join("portable.credential.toml");
+        let (static_private_key, static_public_key) = crate::config::generate_identity_pair();
+        let (_, server_public_key) = crate::config::generate_identity_pair();
+        let public = crate::config::decode_key(&static_public_key).expect("client public key");
+        let bundle = CredentialBundle {
+            version: CREDENTIAL_VERSION,
+            client_id: crate::security::client_id_from_public_key(&public),
+            device_label: "portable".to_owned(),
+            shared_secret: format!("hex:{}", "44".repeat(32)),
+            static_private_key,
+            static_public_key,
+            pinned_server_static_key: server_public_key,
+            custom_headers: BTreeMap::new(),
+        };
+        save_credential_bundle(&path, &bundle).expect("save credential bundle");
+        let settings = directory.0.join("client.toml");
+        let load = || load_runtime(&settings, Some("127.0.0.1".into()), None);
+        let original = load().expect("load issued credential");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("make credential permissions unsafe");
+        #[cfg(windows)]
+        crate::private_file::set_test_dacl(
+            &path,
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FR;;;BU)(A;;FW;;;AU)",
+        );
+        let error = match load() {
+            Ok(_) => panic!("unsafe permissions must fail"),
+            Err(error) => error,
+        };
+        let report = format!("{error} {error:?}");
+        assert!(report.contains("portable.credential.toml"));
+        assert!(report.contains("private file"));
+        assert!(!report.contains(&bundle.static_private_key));
+        assert!(!report.contains(&bundle.shared_secret));
+        assert!(matches!(error, ClientError::CredentialRead { source, .. }
+            if source.kind() == io::ErrorKind::PermissionDenied));
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore private permissions");
+        #[cfg(windows)]
+        crate::private_file::set_test_dacl(&path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)");
+        let restored = load().expect("load transferred credential after restricting permissions");
+        assert_eq!(restored.identity, original.identity);
+        assert_eq!(restored.psk, original.psk);
+        assert_eq!(restored.pinned_server_key, original.pinned_server_key);
     }
 
     #[test]

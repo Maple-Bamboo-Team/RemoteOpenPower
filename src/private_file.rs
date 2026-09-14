@@ -209,6 +209,41 @@ pub(crate) fn validate_windows(file: &fs::File) -> io::Result<()> {
     result
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn set_test_dacl(path: &Path, sddl: &str) {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        },
+    };
+    let text: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor = ptr::null_mut();
+    assert_ne!(
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let set = unsafe {
+        SetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    assert!(unsafe { LocalFree(descriptor) }.is_null());
+    assert_ne!(set, 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,36 +330,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn private_read_rejects_world_readable_dacl() {
-        use std::{os::windows::ffi::OsStrExt, ptr};
-        use windows_sys::Win32::{
-            Foundation::LocalFree,
-            Security::{
-                Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                DACL_SECURITY_INFORMATION, SetFileSecurityW,
-            },
-        };
         let directory = crate::test_support::TestDirectory::new();
         let path = directory.0.join("credential.toml");
         crate::config::write_private_toml(&path, "private").unwrap();
-        let text: Vec<u16> = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FR;;;WD)\0"
-            .encode_utf16()
-            .collect();
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let mut descriptor = ptr::null_mut();
-        assert_ne!(
-            unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    text.as_ptr(),
-                    1,
-                    &mut descriptor,
-                    ptr::null_mut(),
-                )
-            },
-            0
-        );
-        let set = unsafe { SetFileSecurityW(wide.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
-        assert!(unsafe { LocalFree(descriptor) }.is_null());
-        assert_ne!(set, 0);
+        set_test_dacl(&path, "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;FR;;;WD)");
         assert_eq!(
             crate::config::read_private_text(&path, 100)
                 .unwrap_err()
